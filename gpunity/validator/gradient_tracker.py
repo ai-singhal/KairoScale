@@ -89,21 +89,37 @@ def create_gradient_tracking_wrapper(
         # ------------------------------------------------------------------
         try:
             import torch
+            import torch.optim as _toptim
 
             # Patch optimizer.step to count steps and time them
-            _OrigOptimStep = torch.optim.Optimizer.step
             _last_step_time = [None]
 
-            def _tracked_step(self, *args, **kwargs):
-                result = _OrigOptimStep(self, *args, **kwargs)
-                now = time.perf_counter()
-                if _last_step_time[0] is not None:
-                    _metrics["step_times"].append(now - _last_step_time[0])
-                _last_step_time[0] = now
-                _step_counter["count"] += 1
-                return result
+            def _patch_optimizer_step(cls):
+                orig_step = cls.__dict__.get("step")
+                if orig_step is None:
+                    return
+                if getattr(orig_step, "_gpunity_patched", False):
+                    return
 
-            torch.optim.Optimizer.step = _tracked_step
+                def _tracked_step(self, *args, **kwargs):
+                    result = orig_step(self, *args, **kwargs)
+                    now = time.perf_counter()
+                    if _last_step_time[0] is not None:
+                        _metrics["step_times"].append(now - _last_step_time[0])
+                    _last_step_time[0] = now
+                    _step_counter["count"] += 1
+                    return result
+
+                _tracked_step._gpunity_patched = True
+                cls.step = _tracked_step
+
+            for _obj in _toptim.__dict__.values():
+                if (
+                    isinstance(_obj, type)
+                    and issubclass(_obj, _toptim.Optimizer)
+                    and _obj is not _toptim.Optimizer
+                ):
+                    _patch_optimizer_step(_obj)
 
             # Patch loss.backward to capture loss value
             _OrigBackward = torch.Tensor.backward
@@ -134,6 +150,15 @@ def create_gradient_tracking_wrapper(
             sys.path.insert(0, repo_dir)
             os.environ["TRAIN_STEPS"] = str(TOTAL_STEPS)
 
+            def _invoke_fallback_entry(module_obj):
+                for candidate in ("train", "main", "run"):
+                    fn = getattr(module_obj, candidate, None)
+                    if callable(fn):
+                        print(f"[gpunity] Invoking fallback entry function: {{candidate}}()")
+                        fn()
+                        return True
+                return False
+
             entry_path = os.path.join(repo_dir, ENTRY_POINT)
 
             try:
@@ -143,6 +168,8 @@ def create_gradient_tracking_wrapper(
                 module = importlib.util.module_from_spec(spec)
                 sys.modules["__train_module__"] = module
                 spec.loader.exec_module(module)
+                if _step_counter["count"] == 0:
+                    _invoke_fallback_entry(module)
             except Exception as e:
                 print(f"[gpunity] Training error: {{e}}")
                 import traceback

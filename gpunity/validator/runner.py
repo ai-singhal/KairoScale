@@ -50,6 +50,7 @@ async def _run_single(
             repo_path=repo_path,
             script_content=wrapper,
             timeout_seconds=600,
+            python_bin=run_config.python_bin,
         )
     else:
         from gpunity.sandbox.modal_runner import run_in_modal

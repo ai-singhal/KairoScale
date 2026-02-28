@@ -166,19 +166,34 @@ def create_profiling_wrapper(
 
         try:
             import torch
+            import torch.optim as _toptim
 
-            _OrigOptimStep = torch.optim.Optimizer.step
+            def _patch_optimizer_step(cls):
+                orig_step = cls.__dict__.get("step")
+                if orig_step is None:
+                    return
+                if getattr(orig_step, "_gpunity_patched", False):
+                    return
 
-            def _counted_step(self, *args, **kwargs):
-                result = _OrigOptimStep(self, *args, **kwargs)
-                now = time.perf_counter()
-                if _step_counter["last_step_time"] is not None:
-                    _step_counter["step_times"].append(now - _step_counter["last_step_time"])
-                _step_counter["last_step_time"] = now
-                _step_counter["count"] += 1
-                return result
+                def _counted_step(self, *args, **kwargs):
+                    result = orig_step(self, *args, **kwargs)
+                    now = time.perf_counter()
+                    if _step_counter["last_step_time"] is not None:
+                        _step_counter["step_times"].append(now - _step_counter["last_step_time"])
+                    _step_counter["last_step_time"] = now
+                    _step_counter["count"] += 1
+                    return result
 
-            torch.optim.Optimizer.step = _counted_step
+                _counted_step._gpunity_patched = True
+                cls.step = _counted_step
+
+            for _obj in _toptim.__dict__.values():
+                if (
+                    isinstance(_obj, type)
+                    and issubclass(_obj, _toptim.Optimizer)
+                    and _obj is not _toptim.Optimizer
+                ):
+                    _patch_optimizer_step(_obj)
         except Exception:
             pass
 
@@ -191,6 +206,15 @@ def create_profiling_wrapper(
             # Add repo to path
             repo_dir = os.environ.get("REPO_DIR", os.getcwd())
             sys.path.insert(0, repo_dir)
+
+            def _invoke_fallback_entry(module_obj):
+                for candidate in ("train", "main", "run"):
+                    fn = getattr(module_obj, candidate, None)
+                    if callable(fn):
+                        print(f"[gpunity] Invoking fallback entry function: {{candidate}}()")
+                        fn()
+                        return True
+                return False
 
             # Override TRAIN_STEPS env so fixture respects our step count
             os.environ["TRAIN_STEPS"] = str(TOTAL_STEPS)
@@ -280,6 +304,11 @@ def create_profiling_wrapper(
                     fn()
                 else:
                     spec.loader.exec_module(module)
+                    # Many training scripts guard execution with
+                    # `if __name__ == "__main__": train()`. Since we import
+                    # as a module, invoke common entry functions if nothing ran.
+                    if _step_counter["count"] == 0:
+                        _invoke_fallback_entry(module)
 
                 if profiler_ctx is not None:
                     profiler_ctx.__exit__(None, None, None)

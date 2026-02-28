@@ -30,7 +30,8 @@ def main() -> None:
 @click.argument("repo_path", type=click.Path(exists=True))
 @click.option("--entry", "entry_point", default="train.py", help="Training script entry point.")
 @click.option("--train-function", default=None, help="Function containing the training loop.")
-@click.option("--provider", default="claude", type=click.Choice(["claude", "openai", "custom"]),
+@click.option("--provider", default="claude",
+              type=click.Choice(["claude", "openai", "heuristic", "custom"]),
               help="LLM provider.")
 @click.option("--model", default=None, help="Model override for the provider.")
 @click.option("--gpu", "gpu_type", default="a100-80gb",
@@ -51,6 +52,8 @@ def main() -> None:
 @click.option("--verbose", is_flag=True, help="Show detailed logs.")
 @click.option("--dry-run", is_flag=True, help="Run profile + analyze only, skip validation.")
 @click.option("--local", is_flag=True, help="Use local runner instead of Modal.")
+@click.option("--python-bin", default=None, type=click.Path(exists=True),
+              help="Python binary for local wrapper execution.")
 @click.option("--config-file", default=None, type=click.Path(exists=True),
               help="YAML configuration file.")
 def run(repo_path: str, config_file: Optional[str], **kwargs: object) -> None:
@@ -81,6 +84,8 @@ def run(repo_path: str, config_file: Optional[str], **kwargs: object) -> None:
 @click.option("--warmup-steps", default=5, type=int, help="Warmup steps before profiling.")
 @click.option("--gpu", "gpu_type", default="a100-80gb", help="GPU type.")
 @click.option("--local", is_flag=True, help="Use local runner.")
+@click.option("--python-bin", default=None, type=click.Path(exists=True),
+              help="Python binary for local wrapper execution.")
 @click.option("--verbose", is_flag=True, help="Show detailed logs.")
 def profile(repo_path: str, **kwargs: object) -> None:
     """Run profiling only (Phase 1).
@@ -100,7 +105,9 @@ def profile(repo_path: str, **kwargs: object) -> None:
 @click.argument("profile_dir", type=click.Path(exists=True))
 @click.option("--repo", "repo_path", required=True, type=click.Path(exists=True),
               help="Path to the repo.")
-@click.option("--provider", default="claude", help="LLM provider.")
+@click.option("--provider", default="claude",
+              type=click.Choice(["claude", "openai", "heuristic", "custom"]),
+              help="LLM provider.")
 @click.option("--model", default=None, help="Model override.")
 @click.option("--max-configs", default=10, type=int, help="Total configs to generate.")
 @click.option("--top-k", default=5, type=int, help="Configs to select.")
@@ -124,6 +131,8 @@ def analyze(profile_dir: str, repo_path: str, **kwargs: object) -> None:
 @click.option("--validation-steps", default=50, type=int, help="Steps per validation run.")
 @click.option("--divergence-threshold", default=0.8, type=float, help="Cosine sim threshold.")
 @click.option("--local", is_flag=True, help="Use local runner.")
+@click.option("--python-bin", default=None, type=click.Path(exists=True),
+              help="Python binary for local wrapper execution.")
 @click.option("--verbose", is_flag=True, help="Show detailed logs.")
 def validate(config_dir: str, repo_path: str, **kwargs: object) -> None:
     """Run validation only (Phase 3) from saved configs.
@@ -224,6 +233,7 @@ async def run_profile_phase(config: RunConfig):
             repo_path=repo_path,
             script_content=wrapper_script,
             timeout_seconds=300,
+            python_bin=config.python_bin,
         )
     else:
         from gpunity.sandbox.modal_runner import run_in_modal

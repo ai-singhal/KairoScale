@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import os
-import subprocess
+import sys
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 from gpunity.utils.logging import get_logger
 
@@ -21,6 +22,7 @@ async def run_locally(
     repo_path: Path,
     script_content: str,
     timeout_seconds: int = 300,
+    python_bin: Optional[str] = None,
 ) -> Path:
     """Run a script in a local subprocess.
 
@@ -32,6 +34,7 @@ async def run_locally(
         repo_path: Path to the user's repository.
         script_content: The Python script to execute.
         timeout_seconds: Maximum execution time in seconds.
+        python_bin: Optional Python interpreter path for wrapper execution.
 
     Returns:
         Path to the directory containing output artifacts.
@@ -46,8 +49,10 @@ async def run_locally(
     script_dir = Path(tempfile.mkdtemp(prefix="gpunity_script_"))
     script_path = script_dir / "gpunity_wrapper.py"
     script_path.write_text(script_content)
+    interpreter = python_bin or sys.executable
 
     logger.info(f"Running locally in {repo_path}")
+    logger.info(f"Interpreter: {interpreter}")
     logger.info(f"Artifacts dir: {artifact_dir}")
 
     env = os.environ.copy()
@@ -57,7 +62,7 @@ async def run_locally(
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "python3", str(script_path),
+            interpreter, str(script_path),
             cwd=str(repo_path),
             env=env,
             stdout=asyncio.subprocess.PIPE,

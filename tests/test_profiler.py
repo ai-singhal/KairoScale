@@ -99,3 +99,14 @@ class TestCreateProfilingWrapper:
         )
         assert "profile_result.json" in script
         assert "dataloader_stats.json" in script
+
+    def test_containsFallbackEntryInvocation(self):
+        script = create_profiling_wrapper(
+            repo_path=Path("/tmp/repo"),
+            entry_point="train.py",
+            train_function=None,
+            warmup_steps=5,
+            profile_steps=20,
+        )
+        assert "_invoke_fallback_entry" in script
+        assert "\"train\", \"main\", \"run\"" in script

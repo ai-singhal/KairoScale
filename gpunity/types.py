@@ -275,6 +275,7 @@ class RunConfig:
     verbose: bool = False
     dry_run: bool = False
     local: bool = False
+    python_bin: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict."""

@@ -60,6 +60,21 @@ async def run_agent_loop(
     Returns:
         Ranked, diversity-filtered list of OptimizationConfig.
     """
+    if config.provider == "heuristic":
+        from gpunity.agent.heuristic import generate_heuristic_configs
+
+        candidates = generate_heuristic_configs(
+            profile=profile,
+            repo_path=repo_path,
+            max_configs=config.max_configs,
+        )
+        selected = select_diverse_configs(candidates, top_k=config.top_k)
+        logger.info(
+            f"Heuristic provider selected {len(selected)} configs from "
+            f"{len(candidates)} candidates."
+        )
+        return selected
+
     provider = _get_provider(config)
     tools = get_agent_tools(profile, repo_path)
     system_prompt = get_system_prompt(profile.summary())

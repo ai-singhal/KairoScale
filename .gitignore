@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local GPUnity runtime artifacts
+gpunity_report.md

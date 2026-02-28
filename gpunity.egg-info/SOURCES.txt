@@ -12,6 +12,7 @@ gpunity.egg-info/requires.txt
 gpunity.egg-info/top_level.txt
 gpunity/agent/__init__.py
 gpunity/agent/diversity.py
+gpunity/agent/heuristic.py
 gpunity/agent/loop.py
 gpunity/agent/prompts.py
 gpunity/agent/tools.py
@@ -48,7 +49,10 @@ tests/test_agent_tools.py
 tests/test_config.py
 tests/test_divergence.py
 tests/test_diversity.py
+tests/test_heuristic.py
+tests/test_patcher.py
 tests/test_profiler.py
 tests/test_reporter.py
 tests/test_types.py
 tests/test_utils.py
+tests/test_validator_wrapper.py

@@ -6,7 +6,9 @@ scripts, and downloads artifacts back to the local filesystem.
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -91,9 +93,20 @@ async def run_in_modal(
     app = await modal.App.lookup.aio("gpunity-sandbox", create_if_missing=True)
 
     try:
+        wrapper_done_flag = "/tmp/gpunity_wrapper_done"
+        wrapper_exit_code_file = "/tmp/gpunity_wrapper_exit_code"
+        runner_cmd = (
+            "python3 /root/script/gpunity_wrapper.py; "
+            "code=$?; "
+            f"echo $code > {wrapper_exit_code_file}; "
+            f"touch {wrapper_done_flag}; "
+            "sleep 600"
+        )
+
         sb = await modal.Sandbox.create.aio(
-            "python3",
-            "/root/script/gpunity_wrapper.py",
+            "bash",
+            "-lc",
+            runner_cmd,
             image=image,
             gpu=modal_gpu,
             timeout=timeout_seconds,
@@ -105,31 +118,81 @@ async def run_in_modal(
             app=app,
         )
 
-        # Wait for completion
-        await sb.wait.aio()
+        # Wait for the wrapper script to complete while keeping sandbox alive.
+        start = time.monotonic()
+        while True:
+            if time.monotonic() - start > timeout_seconds:
+                raise RuntimeError(
+                    f"Modal sandbox timed out after {timeout_seconds}s waiting for wrapper completion."
+                )
+            try:
+                tmp_items = await sb.ls.aio("/tmp")
+                if Path(wrapper_done_flag).name in tmp_items:
+                    break
+            except Exception:
+                # Sandbox may still be booting; retry.
+                pass
+            await asyncio.sleep(1.0)
 
-        # Get output
-        stdout = await sb.stdout.read.aio()
-        stderr = await sb.stderr.read.aio()
+        # Fetch wrapper exit code written by the runner command.
+        exit_code_handle = await sb.open.aio(wrapper_exit_code_file, "r")
+        try:
+            wrapper_exit_code_raw = await exit_code_handle.read.aio()
+        finally:
+            await exit_code_handle.close.aio()
+
+        try:
+            wrapper_exit_code = int(str(wrapper_exit_code_raw).strip())
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Could not parse wrapper exit code from {wrapper_exit_code_file}: {wrapper_exit_code_raw!r}"
+            ) from exc
+
+        # Download artifacts from sandbox (use async file APIs for Modal>=1.x)
+        artifact_items = await sb.ls.aio(sandbox_artifact_dir)
+        for item in artifact_items:
+            remote_path = f"{sandbox_artifact_dir}/{item}"
+            try:
+                file_handle = await sb.open.aio(remote_path, "rb")
+                try:
+                    content = await file_handle.read.aio()
+                finally:
+                    await file_handle.close.aio()
+
+                dest = local_artifact_dir / item
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(content)
+            except Exception:
+                # Skip non-regular files.
+                continue
+
+        # Terminate the sleep process, then read full logs.
+        await sb.terminate.aio()
+        try:
+            await sb.wait.aio()
+        except Exception:
+            # Expected after explicit terminate() on some Modal SDK versions.
+            pass
+
+        try:
+            stdout = await sb.stdout.read.aio()
+        except Exception:
+            stdout = ""
+        try:
+            stderr = await sb.stderr.read.aio()
+        except Exception:
+            stderr = ""
 
         if stdout:
             logger.info(f"Modal stdout:\n{stdout}")
         if stderr:
             logger.debug(f"Modal stderr:\n{stderr}")
 
-        returncode = sb.returncode
-        if returncode != 0:
+        if wrapper_exit_code != 0:
             raise RuntimeError(
-                f"Modal sandbox exited with code {returncode}.\n"
+                f"Modal wrapper exited with code {wrapper_exit_code}.\n"
                 f"stderr: {stderr[-2000:] if stderr else '(empty)'}"
             )
-
-        # Download artifacts from sandbox
-        for item in sb.ls(sandbox_artifact_dir):
-            content = sb.read_file(f"{sandbox_artifact_dir}/{item}")
-            dest = local_artifact_dir / item
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(content)
 
     except Exception as e:
         if "Sandbox" in str(type(e).__name__):

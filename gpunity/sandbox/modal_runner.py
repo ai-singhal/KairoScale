@@ -35,8 +35,8 @@ async def run_in_modal(
 ) -> Path:
     """Run a script in a Modal sandbox with GPU.
 
-    Creates a Modal Sandbox, mounts the user's repo, executes the
-    profiling/validation script, and downloads artifacts.
+    Creates a Modal Sandbox, copies the user's repo and wrapper script
+    into the image, executes it, and downloads artifacts.
 
     Args:
         repo_path: Path to the user's repository.
@@ -64,10 +64,21 @@ async def run_in_modal(
     repo_path = Path(repo_path).resolve()
     image_spec = build_image_spec(repo_path, extra_deps)
 
-    # Build Modal image
+    # Build Modal image with repo and script baked in
     image = modal.Image.debian_slim(python_version=image_spec["python_version"])
     if image_spec["pip_packages"]:
         image = image.pip_install(*image_spec["pip_packages"])
+
+    # Add repo files and wrapper script into the image
+    image = image.add_local_dir(str(repo_path), remote_path="/root/repo")
+
+    # Create artifact directory locally
+    local_artifact_dir = Path(tempfile.mkdtemp(prefix="gpunity_modal_artifacts_"))
+
+    # Write script to a temp file and add to image
+    script_path = local_artifact_dir / "gpunity_wrapper.py"
+    script_path.write_text(script_content, encoding="utf-8")
+    image = image.add_local_file(str(script_path), remote_path="/root/script/gpunity_wrapper.py")
 
     # Determine Modal GPU config
     modal_gpu = _MODAL_GPU_MAP.get(gpu_type, "A100")
@@ -75,31 +86,18 @@ async def run_in_modal(
     logger.info(f"Creating Modal sandbox with {modal_gpu} GPU")
     logger.info(f"Timeout: {timeout_seconds}s, Cost ceiling: ${cost_ceiling_usd}")
 
-    # Create artifact directory locally
-    local_artifact_dir = Path(tempfile.mkdtemp(prefix="gpunity_modal_artifacts_"))
-
-    app = modal.App("gpunity-sandbox")
-
-    # Write script to a temp file for mounting
-    script_path = local_artifact_dir / "gpunity_wrapper.py"
-    script_path.write_text(script_content)
-
     sandbox_artifact_dir = "/tmp/gpunity_artifacts"
 
+    app = await modal.App.lookup.aio("gpunity-sandbox", create_if_missing=True)
+
     try:
-        sb = modal.Sandbox.create(
+        sb = await modal.Sandbox.create.aio(
             "python3",
             "/root/script/gpunity_wrapper.py",
             image=image,
             gpu=modal_gpu,
             timeout=timeout_seconds,
-            mounts=[
-                modal.Mount.from_local_dir(str(repo_path), remote_path="/root/repo"),
-                modal.Mount.from_local_file(
-                    str(script_path), remote_path="/root/script/gpunity_wrapper.py"
-                ),
-            ],
-            environment={
+            env={
                 "ARTIFACT_DIR": sandbox_artifact_dir,
                 "REPO_DIR": "/root/repo",
                 "PYTHONPATH": "/root/repo",
@@ -108,11 +106,11 @@ async def run_in_modal(
         )
 
         # Wait for completion
-        sb.wait()
+        await sb.wait.aio()
 
         # Get output
-        stdout = sb.stdout.read()
-        stderr = sb.stderr.read()
+        stdout = await sb.stdout.read.aio()
+        stderr = await sb.stderr.read.aio()
 
         if stdout:
             logger.info(f"Modal stdout:\n{stdout}")
@@ -127,7 +125,6 @@ async def run_in_modal(
             )
 
         # Download artifacts from sandbox
-        # Use sandbox exec to tar and extract artifacts
         for item in sb.ls(sandbox_artifact_dir):
             content = sb.read_file(f"{sandbox_artifact_dir}/{item}")
             dest = local_artifact_dir / item

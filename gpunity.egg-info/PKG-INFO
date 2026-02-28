@@ -1,0 +1,27 @@
+Metadata-Version: 2.4
+Name: gpunity
+Version: 0.1.0
+Summary: ML Training Optimization Pipeline — profile, analyze, validate, and report.
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: click>=8.1
+Requires-Dist: pyyaml>=6.0
+Provides-Extra: claude
+Requires-Dist: anthropic>=0.39; extra == "claude"
+Provides-Extra: openai
+Requires-Dist: openai>=1.12; extra == "openai"
+Provides-Extra: modal
+Requires-Dist: modal>=0.64; extra == "modal"
+Provides-Extra: charts
+Requires-Dist: matplotlib>=3.8; extra == "charts"
+Provides-Extra: all
+Requires-Dist: anthropic>=0.39; extra == "all"
+Requires-Dist: openai>=1.12; extra == "all"
+Requires-Dist: modal>=0.64; extra == "all"
+Requires-Dist: matplotlib>=3.8; extra == "all"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.23; extra == "dev"
+
+# AutoProfile

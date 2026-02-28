@@ -78,7 +78,7 @@ def generate_report(
     sections.append(_render_appendix(profile, configs))
 
     report = "\n\n".join(sections)
-    output_path.write_text(report)
+    output_path.write_text(report, encoding="utf-8")
 
     logger.info(f"Report written to: {output_path}")
     return output_path

@@ -168,7 +168,7 @@ ProfileResult:
 
 ### Goal
 
-An LLM agent reads the profile artifacts + the user's source code and proposes $k$ optimization configurations. Each config is grounded in specific profile evidence — no hallucinated suggestions.
+An LLM agent reads the profile artifacts + the user's source code and proposes $k$ optimization configurations. Each config is grounded in specific profile evidence — no hallucinated suggestions. The evidence should be visible in the final report (I cannot emphasize this enough).
 
 ### Agent Architecture
 

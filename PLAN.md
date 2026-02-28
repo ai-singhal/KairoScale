@@ -228,14 +228,24 @@ The agent is prompted to consider these categories and ONLY suggest optimization
 
 | Category | Example Optimizations | Profile Signal |
 |----------|----------------------|----------------|
+| Data Loading | Pre-tokenization, worker tuning, pinned memory, async prefetch | High `dataloader_stall_time`, `dataloader_bottleneck=True` |
 | Attention | Flash Attention, memory-efficient attention | High % GPU time in `aten::scaled_dot_product_attention` or manual attention ops |
 | Compilation | `torch.compile`, inductor backends | Many small kernels, low GPU utilization, high kernel launch overhead |
+| Optimizer | SGD/RMSProp/AdamW/Adafactor/MUON swaps, Triton-fused optimizer kernels | Backward-heavy runtime, optimizer kernels in top ops |
 | Mixed Precision | AMP, bf16, fp8 | Already in fp32, memory-bound ops dominating |
-| Data Loading | Pre-tokenization, more workers, prefetch | High `dataloader_stall_time`, `dataloader_bottleneck=True` |
+| Inference Stack | MLA paths, n-gram/speculative caches, float8 kernel libraries | Inference mode with attention/cache bottlenecks |
 | Parallelism | FSDP, tensor parallel | Single-GPU, memory near capacity, model too large |
 | Memory | Gradient checkpointing, activation offload | Peak memory near GPU limit, large activation tensors |
 | Kernel Fusion | Custom fused ops, `torch.compile` | Many small sequential ops that could be fused |
 | Communication | Overlap compute/comm, gradient bucketing | Multi-GPU with comm overhead (future) |
+
+### Native Baseline Policy (Updated)
+
+- Keep the native baseline ladder minimal and compile-focused:
+  - `B1`: `torch.compile(max-autotune-no-cudagraphs)` for single-GPU runs, fallback `default`.
+  - `B2`: `torch.compile(max-autotune + CUDA Graphs)` for multi-GPU cluster runs, fallback `reduce-overhead`.
+- `B0` remains the eager control run.
+- The LLM agent should prioritize data processing and non-baseline model/runtime changes after these baseline compile paths are covered.
 
 ### Diversity Selection
 
@@ -269,7 +279,7 @@ OptimizationConfig:
 ### Open Questions — Phase 2
 
 - **Code patching strategy**: Should the agent output unified diffs, or full file replacements? Diffs are more token-efficient but harder to apply reliably. Leaning toward full file replacements for changed files.
-- **Config-only vs code changes**: Some optimizations are pure config (set `torch.compile(model)` or `precision=bf16`). Others require code changes (swap attention implementation). The agent should prefer config-only changes when possible since they're lower risk.
+- **Config-only vs code changes**: Some optimizations are pure config (precision, dataloader knobs, compile fallback modes). Others require code changes (attention/optimizer rewrites, Triton kernels). Prefer config-only when impact is similar, but allow code changes for data pipeline and optimizer hotspots.
 - **Agent calibration**: How do we prevent the agent from being overconfident in estimated speedups? Include few-shot examples of realistic estimates, and emphasize that validation will catch bad estimates.
 
 ---

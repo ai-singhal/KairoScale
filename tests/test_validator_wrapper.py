@@ -41,3 +41,4 @@ def test_gradientTrackingWrapperContainsDeterminismAndOverrides():
     assert "DETERMINISTIC_VALIDATION = True" in script
     assert ".gpunity_overrides.json" in script
     assert "logit_signatures" in script
+    assert "compile_fallback_mode" in script

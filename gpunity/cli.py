@@ -44,9 +44,25 @@ def _export_configs(configs, output_dir: Path) -> Path:
               type=click.Choice(["claude", "openai", "heuristic", "custom"]),
               help="LLM provider.")
 @click.option("--model", default=None, help="Model override for the provider.")
+@click.option("--mode", default="auto", type=click.Choice(["auto", "train", "infer"]),
+              help="Workload mode.")
+@click.option("--baseline-policy", default="required",
+              type=click.Choice(["required", "minimal"]),
+              help="Native baseline ladder policy.")
+@click.option("--compare-against-native/--no-compare-against-native", default=True,
+              help="Compare winner against best native baseline.")
+@click.option("--hardware-profile", default="auto", type=click.Choice(["auto", "manual"]),
+              help="Hardware profile mode.")
+@click.option("--objective-profile", default="balanced",
+              type=click.Choice(["balanced", "latency", "cost", "throughput"]),
+              help="Objective profile for winner selection.")
+@click.option("--ablation-top-k", default=3, type=int,
+              help="Attach ablation contribution notes for top-k scored configs.")
 @click.option("--gpu", "gpu_type", default="a100-80gb",
               type=click.Choice(["a100-80gb", "a100-40gb", "h100", "a10g"]),
               help="GPU type for sandboxes.")
+@click.option("--gpu-count", default=1, type=int,
+              help="Target number of GPUs (set >1 for cluster-oriented baseline policy).")
 @click.option("--profile-steps", default=20, type=int, help="Steps to profile.")
 @click.option("--warmup-steps", default=5, type=int, help="Warmup steps before profiling.")
 @click.option("--validation-steps", default=50, type=int, help="Steps per validation run.")
@@ -91,6 +107,8 @@ def run(repo_path: str, config_file: Optional[str], **kwargs: object) -> None:
     click.echo(f"GPUnity v0.1.0 -- Optimizing {config.repo_path}")
     click.echo(f"  Entry point: {config.entry_point}")
     click.echo(f"  Provider: {config.provider}")
+    click.echo(f"  Objective: {config.objective_profile}")
+    click.echo(f"  Compare native: {config.compare_against_native}")
     click.echo(f"  Mode: {'local' if config.local else 'modal'}")
     click.echo()
 
@@ -105,6 +123,7 @@ def run(repo_path: str, config_file: Optional[str], **kwargs: object) -> None:
 @click.option("--profile-steps", default=20, type=int, help="Steps to profile.")
 @click.option("--warmup-steps", default=5, type=int, help="Warmup steps before profiling.")
 @click.option("--gpu", "gpu_type", default="a100-80gb", help="GPU type.")
+@click.option("--gpu-count", default=1, type=int, help="Target number of GPUs.")
 @click.option("--local", is_flag=True, help="Use local runner.")
 @click.option("--python-bin", default=None, type=click.Path(exists=True),
               help="Python binary for local wrapper execution.")
@@ -133,6 +152,7 @@ def profile(repo_path: str, **kwargs: object) -> None:
 @click.option("--model", default=None, help="Model override.")
 @click.option("--max-configs", default=10, type=int, help="Total configs to generate.")
 @click.option("--top-k", default=5, type=int, help="Configs to select.")
+@click.option("--gpu-count", default=1, type=int, help="Target number of GPUs.")
 @click.option("--verbose", is_flag=True, help="Show detailed logs.")
 def analyze(profile_dir: str, repo_path: str, **kwargs: object) -> None:
     """Run analysis only (Phase 2) from saved profile artifacts.
@@ -150,6 +170,20 @@ def analyze(profile_dir: str, repo_path: str, **kwargs: object) -> None:
 @click.argument("config_dir", type=click.Path(exists=True))
 @click.option("--repo", "repo_path", required=True, type=click.Path(exists=True),
               help="Path to the repo.")
+@click.option("--mode", default="auto", type=click.Choice(["auto", "train", "infer"]),
+              help="Workload mode.")
+@click.option("--baseline-policy", default="required",
+              type=click.Choice(["required", "minimal"]),
+              help="Native baseline ladder policy.")
+@click.option("--compare-against-native/--no-compare-against-native", default=True,
+              help="Compare winner against best native baseline.")
+@click.option("--hardware-profile", default="auto", type=click.Choice(["auto", "manual"]),
+              help="Hardware profile mode.")
+@click.option("--objective-profile", default="balanced",
+              type=click.Choice(["balanced", "latency", "cost", "throughput"]),
+              help="Objective profile for winner selection.")
+@click.option("--ablation-top-k", default=3, type=int,
+              help="Attach ablation contribution notes for top-k scored configs.")
 @click.option("--validation-steps", default=50, type=int, help="Steps per validation run.")
 @click.option("--divergence-threshold", default=0.8, type=float, help="Cosine sim threshold.")
 @click.option("--logits-tolerance", default=1e-3, type=float,
@@ -164,6 +198,7 @@ def analyze(profile_dir: str, repo_path: str, **kwargs: object) -> None:
               help="Validation fanout strategy across sandboxes.")
 @click.option("--staged-top-k", default=2, type=int,
               help="For staged strategy: number of configs promoted to full validation.")
+@click.option("--gpu-count", default=1, type=int, help="Target number of GPUs.")
 @click.option("--local", is_flag=True, help="Use local runner.")
 @click.option("--python-bin", default=None, type=click.Path(exists=True),
               help="Python binary for local wrapper execution.")
@@ -221,10 +256,27 @@ async def run_pipeline(config: RunConfig) -> Path:
     profile_result = await run_profile_phase(config)
     logger.info("Phase 1 complete.")
 
+    from gpunity.hardware.profile import detect_hardware_profile, resolve_workload_mode
+
+    hardware = detect_hardware_profile(config)
+    mode = resolve_workload_mode(config.mode, profile_result)
+    logger.info(
+        "Resolved mode=%s, hardware=%s (%s)",
+        mode,
+        hardware.gpu_name,
+        hardware.detection_source,
+    )
+
     # Phase 2: Analyze
     logger.info("Phase 2: Generating optimization configs...")
     from gpunity.agent.loop import run_agent_loop
-    optimization_configs = await run_agent_loop(profile_result, Path(config.repo_path), config)
+    optimization_configs = await run_agent_loop(
+        profile_result,
+        Path(config.repo_path),
+        config,
+        hardware_profile=hardware,
+        mode=mode,
+    )
     logger.info(f"Phase 2 complete. Generated {len(optimization_configs)} configs.")
     config_export_dir = _export_configs(
         optimization_configs,
@@ -234,21 +286,28 @@ async def run_pipeline(config: RunConfig) -> Path:
     # Phase 3: Validate (unless dry_run)
     control_run = None
     validation_results = []
+    run_summary = None
     if not config.dry_run:
         logger.info("Phase 3: Validating configs...")
         from gpunity.validator.runner import run_validation
-        control_run, validation_results = await run_validation(
-            Path(config.repo_path), optimization_configs, config
+        control_run, validation_results, run_summary = await run_validation(
+            Path(config.repo_path),
+            optimization_configs,
+            config,
+            profile=profile_result,
+            hardware_profile=hardware,
+            mode=mode,
         )
         logger.info(f"Phase 3 complete. {len(validation_results)} configs validated.")
     else:
         logger.info("Phase 3: Skipped (dry-run mode).")
-        from gpunity.types import ControlRun
+        from gpunity.types import ControlRun, RunSummary
         control_run = ControlRun(
             steps_completed=0, wall_clock_seconds=0, avg_step_time_ms=0,
             peak_memory_mb=0, throughput_samples_sec=0, loss_values=[],
             gradient_norms=[], cost_estimate_usd=0,
         )
+        run_summary = RunSummary(objective_profile=config.objective_profile, confidence="low")
 
     # Phase 4: Report
     logger.info("Phase 4: Generating report...")
@@ -262,6 +321,9 @@ async def run_pipeline(config: RunConfig) -> Path:
         results=validation_results,
         output_path=output_path,
         config_export_dir=config_export_dir,
+        hardware_profile=hardware,
+        run_summary=run_summary,
+        mode=mode,
     )
     logger.info(f"Phase 4 complete. Report at: {report_path}")
 
@@ -311,10 +373,19 @@ async def run_profile_phase(config: RunConfig):
 async def run_analyze_phase(profile_dir: str, config: RunConfig):
     """Execute Phase 2: Analysis from saved profile."""
     from gpunity.profiler.aggregate import aggregate_profile
+    from gpunity.hardware.profile import detect_hardware_profile, resolve_workload_mode
     from gpunity.agent.loop import run_agent_loop
 
     profile_result = aggregate_profile(Path(profile_dir))
-    configs = await run_agent_loop(profile_result, Path(config.repo_path), config)
+    hardware = detect_hardware_profile(config)
+    mode = resolve_workload_mode(config.mode, profile_result)
+    configs = await run_agent_loop(
+        profile_result,
+        Path(config.repo_path),
+        config,
+        hardware_profile=hardware,
+        mode=mode,
+    )
     return configs
 
 
@@ -322,17 +393,27 @@ async def run_validate_phase(config_dir: str, config: RunConfig):
     """Execute Phase 3: Validation from saved configs."""
     import json
 
-    from gpunity.types import OptimizationConfig
+    from gpunity.hardware.profile import detect_hardware_profile, resolve_workload_mode
+    from gpunity.types import OptimizationConfig, ProfileResult
     from gpunity.validator.runner import run_validation
 
     config_path = Path(config_dir)
     configs = []
-    for cf in sorted(config_path.glob("*/config.json")):
+    for cf in sorted(config_path.glob("*.json")):
         with open(cf) as f:
             configs.append(OptimizationConfig.from_dict(json.load(f)))
 
-    control_run, results = await run_validation(Path(config.repo_path), configs, config)
-    return control_run, results
+    hardware = detect_hardware_profile(config)
+    mode = resolve_workload_mode(config.mode, None)
+    control_run, results, run_summary = await run_validation(
+        Path(config.repo_path),
+        configs,
+        config,
+        profile=ProfileResult(),
+        hardware_profile=hardware,
+        mode=mode,
+    )
+    return control_run, results, run_summary
 
 
 if __name__ == "__main__":

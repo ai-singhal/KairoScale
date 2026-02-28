@@ -20,6 +20,7 @@ def test_getAgentToolsReturnsAllTools():
     assert "read_file" in names
     assert "list_files" in names
     assert "search_code" in names
+    assert "query_supermemory" in names
     assert "propose_config" in names
 
 
@@ -79,3 +80,10 @@ def test_unknownTool(tmp_path):
     ctx = _makeContext(tmp_path)
     result = execute_tool("fake_tool", {}, ctx)
     assert "Unknown tool" in result
+
+
+def test_querySupermemoryMissingApiKey(tmp_path, monkeypatch):
+    monkeypatch.delenv("SUPERMEMORY_API_KEY", raising=False)
+    ctx = _makeContext(tmp_path)
+    result = execute_tool("query_supermemory", {"query": "flash attention"}, ctx)
+    assert "SUPERMEMORY_API_KEY is not set" in result

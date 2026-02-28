@@ -196,6 +196,11 @@ class OptimizationConfig:
     estimated_memory_delta: float = 0.0
     risk_level: RiskLevel = RiskLevel.MEDIUM
     dependencies: list[str] = field(default_factory=list)
+    is_native_baseline: bool = False
+    baseline_id: Optional[str] = None
+    eligible: bool = True
+    ineligible_reason: Optional[str] = None
+    heuristic_rationale: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict for JSON storage."""
@@ -236,6 +241,7 @@ class ValidationResult:
 
     # Performance deltas (vs control)
     speedup_vs_control: float = 1.0
+    throughput_gain_vs_control: float = 0.0
     memory_delta_vs_control: float = 0.0
     cost_delta_vs_control: float = 0.0
 
@@ -256,6 +262,73 @@ class ValidationResult:
     logits_mean_abs_diff: Optional[float] = None
     logits_within_tolerance: Optional[bool] = None
 
+    # Baseline and objective attribution
+    is_native_baseline: bool = False
+    baseline_id: Optional[str] = None
+    objective_score: Optional[float] = None
+    risk_penalty: float = 0.0
+    speedup_vs_best_native: Optional[float] = None
+    cost_delta_vs_best_native: Optional[float] = None
+    throughput_gain_vs_best_native: Optional[float] = None
+    evidence_chain: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BaselineResult:
+    """Outcome for one native baseline candidate."""
+    baseline_id: str
+    name: str
+    eligible: bool
+    success: bool
+    skip_reason: Optional[str] = None
+    speedup_vs_control: Optional[float] = None
+    cost_delta_vs_control: Optional[float] = None
+    throughput_gain_vs_control: Optional[float] = None
+    objective_score: Optional[float] = None
+
+
+@dataclass
+class HardwareProfile:
+    """Detected hardware and runtime feature support."""
+    gpu_name: str
+    gpu_count: int = 1
+    compute_capability: Optional[str] = None
+    vram_mb: Optional[int] = None
+    cuda_version: Optional[str] = None
+    driver_version: Optional[str] = None
+    supports_bf16: bool = False
+    supports_tf32: bool = False
+    supports_fp16: bool = True
+    supports_cuda_graphs: bool = False
+    supports_compile: bool = False
+    detection_source: str = "unknown"
+    confidence: str = "low"
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class EvidenceEdge:
+    """Trace link from a signal to an optimization decision."""
+    source: str
+    target: str
+    relation: str
+    detail: str
+
+
+@dataclass
+class RunSummary:
+    """Top-line objective and baseline comparison summary for a run."""
+    objective_profile: str = "balanced"
+    best_overall_config_id: Optional[str] = None
+    best_native_baseline_id: Optional[str] = None
+    speedup_vs_best_native: Optional[float] = None
+    cost_delta_vs_best_native: Optional[float] = None
+    throughput_gain_vs_best_native: Optional[float] = None
+    objective_weights: dict[str, float] = field(default_factory=dict)
+    baseline_results: list[BaselineResult] = field(default_factory=list)
+    evidence_edges: list[EvidenceEdge] = field(default_factory=list)
+    confidence: str = "medium"
+
 
 @dataclass
 class RunConfig:
@@ -265,7 +338,14 @@ class RunConfig:
     train_function: Optional[str] = None
     provider: str = "claude"
     model: Optional[str] = None
+    mode: str = "auto"
+    baseline_policy: str = "required"
+    compare_against_native: bool = True
+    hardware_profile: str = "auto"
+    objective_profile: str = "balanced"
+    ablation_top_k: int = 3
     gpu_type: str = "a100-80gb"
+    gpu_count: int = 1
     profile_steps: int = 20
     warmup_steps: int = 5
     validation_steps: int = 50

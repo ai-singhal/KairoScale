@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,131 @@ from gpunity.types import (
     ProfileResult,
     RiskLevel,
 )
+
+_SUPERMEMORY_SEARCH_URL = "https://api.supermemory.ai/v4/search"
+
+
+def _supermemory_post(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
+    request = urllib.request.Request(
+        _SUPERMEMORY_SEARCH_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Supermemory HTTP {e.code}: {detail[:500]}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Supermemory connection failed: {e}") from e
+
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as e:
+        raise RuntimeError("Supermemory returned invalid JSON") from e
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Supermemory response must be a JSON object")
+    return parsed
+
+
+def _normalize_supermemory_result(
+    item: dict[str, Any],
+    *,
+    hop: int,
+    source_query: str,
+) -> dict[str, Any]:
+    text = (
+        str(item.get("memory") or item.get("chunk") or item.get("content") or "")
+        .strip()
+        .replace("\n", " ")
+    )
+    return {
+        "id": item.get("id"),
+        "score": item.get("similarity"),
+        "hop": hop,
+        "source_query": source_query,
+        "text": text[:500],
+        "metadata": item.get("metadata", {}),
+    }
+
+
+def _supermemory_query_graph(
+    query: str,
+    *,
+    api_key: str,
+    container_tag: str | None,
+    limit: int,
+    threshold: float,
+    search_mode: str,
+    rerank: bool,
+    max_hops: int,
+    expansion_width: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    frontier = [query]
+    visited_queries: set[str] = set()
+    seen_nodes: set[str] = set()
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+
+    for hop in range(max(0, max_hops) + 1):
+        if not frontier:
+            break
+
+        next_frontier: list[str] = []
+        for active_query in frontier:
+            if active_query in visited_queries:
+                continue
+            visited_queries.add(active_query)
+
+            payload: dict[str, Any] = {
+                "q": active_query,
+                "limit": int(max(1, limit)),
+                "threshold": float(max(0.0, min(1.0, threshold))),
+                "searchMode": search_mode,
+                "rerank": bool(rerank),
+            }
+            if container_tag:
+                payload["containerTags"] = [container_tag]
+
+            response = _supermemory_post(payload, api_key=api_key)
+            raw_results = response.get("results", [])
+            if not isinstance(raw_results, list):
+                continue
+
+            for item in raw_results:
+                if not isinstance(item, dict):
+                    continue
+                normalized = _normalize_supermemory_result(
+                    item,
+                    hop=hop,
+                    source_query=active_query,
+                )
+                node_id = str(normalized.get("id") or normalized["text"])
+                if node_id in seen_nodes:
+                    continue
+                seen_nodes.add(node_id)
+                nodes.append(normalized)
+                edges.append({
+                    "from_query": active_query,
+                    "to_node": node_id,
+                    "hop": hop,
+                })
+
+                if hop >= max_hops or len(next_frontier) >= max(1, expansion_width):
+                    continue
+                seed = normalized["text"][:160].strip()
+                if seed and seed not in visited_queries and seed not in next_frontier:
+                    next_frontier.append(seed)
+
+        frontier = next_frontier
+
+    return nodes, edges
 
 
 def get_agent_tools(profile: ProfileResult, repo_path: Path) -> list[dict[str, Any]]:
@@ -74,6 +201,52 @@ def get_agent_tools(profile: ProfileResult, repo_path: Path) -> list[dict[str, A
                     "query": {
                         "type": "string",
                         "description": "Search pattern (regex supported).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "query_supermemory",
+            "description": (
+                "Query Supermemory for optimization knowledge and optionally perform "
+                "multi-hop graph traversal over related memories/chunks."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query for Supermemory.",
+                    },
+                    "container_tag": {
+                        "type": "string",
+                        "description": "Optional Supermemory container tag filter.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Results per hop (1-20).",
+                    },
+                    "threshold": {
+                        "type": "number",
+                        "description": "Minimum similarity threshold (0.0-1.0).",
+                    },
+                    "search_mode": {
+                        "type": "string",
+                        "enum": ["hybrid", "chunks", "memories"],
+                        "description": "Supermemory search mode.",
+                    },
+                    "rerank": {
+                        "type": "boolean",
+                        "description": "Whether Supermemory reranking should be enabled.",
+                    },
+                    "max_hops": {
+                        "type": "integer",
+                        "description": "Graph traversal depth from the initial query.",
+                    },
+                    "expansion_width": {
+                        "type": "integer",
+                        "description": "Maximum number of follow-up query seeds per hop.",
                     },
                 },
                 "required": ["query"],
@@ -211,6 +384,54 @@ def execute_tool(
                 results.append("... (truncated)")
                 break
         return "\n".join(results) if results else "No matches found."
+
+    elif tool_name == "query_supermemory":
+        query = str(tool_input.get("query", "")).strip()
+        if not query:
+            return "Error: query is required"
+
+        api_key = os.environ.get("SUPERMEMORY_API_KEY", "").strip()
+        if not api_key:
+            return "Error: SUPERMEMORY_API_KEY is not set"
+
+        container_tag = tool_input.get("container_tag")
+        if isinstance(container_tag, str):
+            container_tag = container_tag.strip() or None
+        else:
+            container_tag = None
+
+        limit = int(tool_input.get("limit", 5))
+        threshold = float(tool_input.get("threshold", 0.2))
+        search_mode = str(tool_input.get("search_mode", "hybrid"))
+        rerank = bool(tool_input.get("rerank", True))
+        max_hops = int(tool_input.get("max_hops", 0))
+        expansion_width = int(tool_input.get("expansion_width", 2))
+
+        try:
+            nodes, edges = _supermemory_query_graph(
+                query=query,
+                api_key=api_key,
+                container_tag=container_tag,
+                limit=max(1, min(20, limit)),
+                threshold=max(0.0, min(1.0, threshold)),
+                search_mode=search_mode if search_mode in {"hybrid", "chunks", "memories"} else "hybrid",
+                rerank=rerank,
+                max_hops=max(0, min(2, max_hops)),
+                expansion_width=max(1, min(5, expansion_width)),
+            )
+        except Exception as e:
+            return f"Error querying Supermemory: {e}"
+
+        return json.dumps(
+            {
+                "query": query,
+                "node_count": len(nodes),
+                "edge_count": len(edges),
+                "nodes": nodes,
+                "edges": edges,
+            },
+            indent=2,
+        )
 
     elif tool_name == "propose_config":
         # Validate and return confirmation

@@ -126,12 +126,18 @@ def compute_validation_metrics(
         if control.cost_estimate_usd > 0
         else 0.0
     )
+    throughput_gain = (
+        (throughput - control.throughput_samples_sec) / control.throughput_samples_sec
+        if control.throughput_samples_sec > 0
+        else 0.0
+    )
 
     return ValidationResult(
         config_id=config_id,
         config_name=config_name,
         success=True,
         speedup_vs_control=speedup,
+        throughput_gain_vs_control=throughput_gain,
         memory_delta_vs_control=mem_delta,
         cost_delta_vs_control=cost_delta,
         wall_clock_seconds=wall_clock,

@@ -150,37 +150,40 @@ def render_summary_table(
     """
     lines = []
     lines.append(
-        "| Config | Speedup | Memory Delta | Cost Delta | Diverged? | Avg Similarity | Logits Δmax |"
+        "| Config | Speedup | Throughput Δ | Memory Delta | Cost Delta | Obj Score | vs Best Native | Diverged? | Logits Δmax |"
     )
     lines.append(
-        "|--------|---------|-------------|------------|-----------|----------------|------------|"
+        "|--------|---------|--------------|-------------|------------|-----------|----------------|-----------|------------|"
     )
 
     # Control baseline row
     lines.append(
-        f"| **Control** | 1.00x | baseline | baseline | - | - | - |"
+        f"| **Control** | 1.00x | baseline | baseline | baseline | - | - | - | - |"
     )
 
     for r in results:
         if not r.success:
             lines.append(
-                f"| {r.config_name} | FAILED | - | - | - | - | - |"
+                f"| {r.config_name} | FAILED | - | - | - | - | - | - | - |"
             )
             continue
 
-        avg_sim = (
-            f"{sum(r.gradient_cosine_similarities) / len(r.gradient_cosine_similarities):.3f}"
-            if r.gradient_cosine_similarities
-            else "N/A"
-        )
         diverged = "YES" if r.diverged else "No"
         logits_delta = f"{r.logits_max_abs_diff:.6f}" if r.logits_max_abs_diff is not None else "N/A"
+        objective = f"{r.objective_score:.3f}" if r.objective_score is not None else "N/A"
+        vs_native = (
+            f"{r.speedup_vs_best_native:.2f}x"
+            if r.speedup_vs_best_native is not None
+            else "N/A"
+        )
 
         lines.append(
             f"| {r.config_name} | {r.speedup_vs_control:.2f}x | "
+            f"{r.throughput_gain_vs_control:+.1%} | "
             f"{r.memory_delta_vs_control:+.1%} | "
             f"{r.cost_delta_vs_control:+.1%} | "
-            f"{diverged} | {avg_sim} | {logits_delta} |"
+            f"{objective} | {vs_native} | "
+            f"{diverged} | {logits_delta} |"
         )
 
     return "\n".join(lines) + "\n"

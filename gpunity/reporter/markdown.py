@@ -20,9 +20,11 @@ from gpunity.reporter.charts import (
 )
 from gpunity.types import (
     ControlRun,
+    HardwareProfile,
     OptimizationConfig,
     ProfileResult,
     RunConfig,
+    RunSummary,
     ValidationResult,
 )
 from gpunity.utils.logging import get_logger
@@ -38,6 +40,9 @@ def generate_report(
     results: list[ValidationResult],
     output_path: Path,
     config_export_dir: Optional[Path] = None,
+    hardware_profile: Optional[HardwareProfile] = None,
+    run_summary: Optional[RunSummary] = None,
+    mode: Optional[str] = None,
 ) -> Path:
     """Generate the full Markdown optimization report.
 
@@ -58,10 +63,13 @@ def generate_report(
     sections = []
 
     # Header
-    sections.append(_render_header(run_config))
+    sections.append(_render_header(run_config, mode))
 
     # Executive Summary
-    sections.append(_render_executive_summary(configs, control, results, run_config))
+    sections.append(_render_executive_summary(configs, control, results, run_config, run_summary))
+
+    if hardware_profile is not None:
+        sections.append(_render_hardware_context(hardware_profile))
 
     # Profile Analysis
     sections.append(_render_profile_analysis(profile))
@@ -71,12 +79,16 @@ def generate_report(
 
     # Validation Results (if not dry run)
     if results:
-        sections.append(_render_validation_results(control, results, run_config))
+        sections.append(_render_validation_results(control, results, run_config, run_summary))
+        sections.append(_render_evidence_tracebacks(configs, results, run_summary))
     else:
         sections.append("## Validation Results\n\n*Skipped (dry-run mode).*\n")
 
+    if run_summary is not None and run_summary.baseline_results:
+        sections.append(_render_baseline_ladder(run_summary))
+
     # Recommendations
-    sections.append(_render_recommendations(results, configs))
+    sections.append(_render_recommendations(results, configs, run_summary))
 
     # Appendix
     sections.append(_render_appendix(profile, configs))
@@ -88,11 +100,14 @@ def generate_report(
     return output_path
 
 
-def _render_header(config: RunConfig) -> str:
+def _render_header(config: RunConfig, mode: Optional[str]) -> str:
+    resolved_mode = mode or config.mode
     return (
         f"# GPUnity Optimization Report\n\n"
         f"> **Repo**: `{config.repo_path}` | "
         f"**GPU**: {config.gpu_type} | "
+        f"**Workload**: {resolved_mode} | "
+        f"**Objective**: {config.objective_profile} | "
         f"**Date**: {datetime.now().strftime('%Y-%m-%d %H:%M')} | "
         f"**Mode**: {'local' if config.local else 'modal'}\n"
     )
@@ -103,13 +118,31 @@ def _render_executive_summary(
     control: ControlRun,
     results: list[ValidationResult],
     run_config: RunConfig,
+    run_summary: Optional[RunSummary],
 ) -> str:
     lines = ["## Executive Summary\n"]
+
+    if run_summary is not None and run_summary.best_overall_config_id:
+        lines.append(f"- **Best overall config ID**: `{run_summary.best_overall_config_id}`")
+    if run_summary is not None and run_summary.best_native_baseline_id:
+        lines.append(
+            f"- **Best native baseline**: `{run_summary.best_native_baseline_id}`"
+        )
+    if run_summary is not None and run_summary.speedup_vs_best_native is not None:
+        lines.append(
+            "- **Delta vs best native**: "
+            f"{run_summary.speedup_vs_best_native:.2f}x speedup ratio, "
+            f"{run_summary.cost_delta_vs_best_native:+.1%} cost delta, "
+            f"{run_summary.throughput_gain_vs_best_native:+.1%} throughput gain"
+        )
 
     # Best config
     successful = [r for r in results if r.success and not r.diverged]
     if successful:
-        best = max(successful, key=lambda r: r.speedup_vs_control)
+        best = max(
+            successful,
+            key=lambda r: r.objective_score if r.objective_score is not None else r.speedup_vs_control,
+        )
         lines.append(
             f"- **Best config**: \"{best.config_name}\" -- "
             f"{best.speedup_vs_control:.1f}x speedup, "
@@ -141,6 +174,29 @@ def _render_executive_summary(
     if run_config.dry_run:
         lines.append(f"\n> *Note: This is a dry-run report. Validation was skipped.*")
 
+    return "\n".join(lines)
+
+
+def _render_hardware_context(hardware: HardwareProfile) -> str:
+    lines = ["## Hardware Context\n"]
+    lines.append(f"- GPU: {hardware.gpu_name}")
+    lines.append(f"- Detection source: {hardware.detection_source} ({hardware.confidence} confidence)")
+    if hardware.compute_capability:
+        lines.append(f"- Compute capability: {hardware.compute_capability}")
+    if hardware.vram_mb is not None:
+        lines.append(f"- VRAM: {hardware.vram_mb} MB")
+    if hardware.cuda_version:
+        lines.append(f"- CUDA runtime: {hardware.cuda_version}")
+    if hardware.driver_version:
+        lines.append(f"- Driver: {hardware.driver_version}")
+    lines.append(
+        "- Feature flags: "
+        f"compile={hardware.supports_compile}, "
+        f"cuda_graphs={hardware.supports_cuda_graphs}, "
+        f"bf16={hardware.supports_bf16}, tf32={hardware.supports_tf32}"
+    )
+    for note in hardware.notes:
+        lines.append(f"- Note: {note}")
     return "\n".join(lines)
 
 
@@ -276,12 +332,17 @@ def _render_validation_results(
     control: ControlRun,
     results: list[ValidationResult],
     run_config: RunConfig,
+    run_summary: Optional[RunSummary],
 ) -> str:
     lines = ["## Validation Results\n"]
 
     # Summary table
     lines.append("### Summary\n")
     lines.append(render_summary_table(control, results))
+    if run_summary is not None and run_summary.best_native_baseline_id:
+        lines.append(
+            f"\nBest native baseline for this run: `{run_summary.best_native_baseline_id}`"
+        )
 
     # Control run info
     lines.append(f"\n**Control run**: {control.steps_completed} steps, "
@@ -336,9 +397,87 @@ def _render_validation_results(
     return "\n".join(lines)
 
 
+def _render_evidence_tracebacks(
+    configs: list[OptimizationConfig],
+    results: list[ValidationResult],
+    run_summary: Optional[RunSummary],
+) -> str:
+    lines = ["## Evidence Tracebacks\n"]
+    if run_summary is not None and run_summary.evidence_edges:
+        lines.append("### Evidence Graph\n")
+        for edge in run_summary.evidence_edges[:12]:
+            lines.append(f"- `{edge.source}` -> `{edge.target}` ({edge.relation})")
+        lines.append("")
+
+    config_by_id = {cfg.id: cfg for cfg in configs}
+    successful = [r for r in results if r.success and not r.diverged]
+    if not successful:
+        lines.append("*No successful validated candidates for evidence tracebacks.*")
+        return "\n".join(lines)
+
+    ordered = sorted(
+        successful,
+        key=lambda r: r.objective_score if r.objective_score is not None else r.speedup_vs_control,
+        reverse=True,
+    )[:3]
+
+    best_native_id = run_summary.best_native_baseline_id if run_summary else None
+    for r in ordered:
+        cfg = config_by_id.get(r.config_id)
+        lines.append(f"### {r.config_name}\n")
+        lines.append("**Baseline comparison**")
+        lines.append(f"- vs control speedup: {r.speedup_vs_control:.2f}x")
+        lines.append(f"- vs control cost delta: {r.cost_delta_vs_control:+.1%}")
+        lines.append(f"- vs control throughput delta: {r.throughput_gain_vs_control:+.1%}")
+        if r.speedup_vs_best_native is not None and best_native_id:
+            lines.append(f"- vs best native (`{best_native_id}`): {r.speedup_vs_best_native:.2f}x")
+
+        lines.append("\n**Profiler traceback**")
+        if r.evidence_chain:
+            for ev in r.evidence_chain:
+                lines.append(f"- {ev}")
+        else:
+            lines.append("- No evidence chain captured.")
+
+        lines.append("\n**Validation block**")
+        lines.append(f"- Diverged: {'YES' if r.diverged else 'No'}")
+        lines.append(f"- Logit checks: {r.logits_checks_compared}")
+        if r.logits_max_abs_diff is not None:
+            lines.append(f"- Logit max abs diff: {r.logits_max_abs_diff:.6f}")
+        lines.append(f"- Objective score: {r.objective_score:.3f}" if r.objective_score is not None else "- Objective score: N/A")
+
+        lines.append("\n**Code traceback**")
+        if cfg is None or not cfg.code_changes:
+            lines.append("- No code patch required (runtime/config optimization).")
+        else:
+            for rel_path in cfg.code_changes.keys():
+                lines.append(f"- Modified file: `{rel_path}`")
+    return "\n".join(lines)
+
+
+def _render_baseline_ladder(run_summary: RunSummary) -> str:
+    lines = ["## Native Baseline Ladder\n"]
+    lines.append("| Baseline | Eligible | Success | Speedup vs Control | Throughput Δ | Cost Δ | Obj Score |")
+    lines.append("|----------|----------|---------|--------------------|--------------|--------|-----------|")
+    for b in run_summary.baseline_results:
+        speed = f"{b.speedup_vs_control:.2f}x" if b.speedup_vs_control is not None else "-"
+        thr = f"{b.throughput_gain_vs_control:+.1%}" if b.throughput_gain_vs_control is not None else "-"
+        cost = f"{b.cost_delta_vs_control:+.1%}" if b.cost_delta_vs_control is not None else "-"
+        obj = f"{b.objective_score:.3f}" if b.objective_score is not None else "-"
+        success = "YES" if b.success else "No"
+        eligible = "YES" if b.eligible else "No"
+        lines.append(
+            f"| {b.baseline_id} ({b.name}) | {eligible} | {success} | {speed} | {thr} | {cost} | {obj} |"
+        )
+        if b.skip_reason and not b.eligible:
+            lines.append(f"\n- `{b.baseline_id}` skipped: {b.skip_reason}")
+    return "\n".join(lines)
+
+
 def _render_recommendations(
     results: list[ValidationResult],
     configs: list[OptimizationConfig],
+    run_summary: Optional[RunSummary],
 ) -> str:
     lines = ["## Recommendations\n"]
 

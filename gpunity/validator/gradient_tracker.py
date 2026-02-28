@@ -17,6 +17,7 @@ def create_gradient_tracking_wrapper(
     steps: int,
     gradient_check_interval: int,
     artifact_dir: Path,
+    mode: str = "train",
     validation_seed: int = 1337,
     deterministic_validation: bool = True,
 ) -> str:
@@ -34,6 +35,7 @@ def create_gradient_tracking_wrapper(
         steps: Total training steps.
         gradient_check_interval: Steps between gradient checkpoints.
         artifact_dir: Directory for output artifacts.
+        mode: Workload mode (`train` or `infer`).
         validation_seed: Seed for deterministic replay.
         deterministic_validation: Whether to enforce deterministic settings.
 
@@ -59,6 +61,7 @@ def create_gradient_tracking_wrapper(
         ENTRY_POINT = "{entry_point}"
         TOTAL_STEPS = {steps}
         GRADIENT_CHECK_INTERVAL = {gradient_check_interval}
+        MODE = "{mode}"
         VALIDATION_SEED = {validation_seed}
         DETERMINISTIC_VALIDATION = {deterministic_validation}
 
@@ -98,13 +101,17 @@ def create_gradient_tracking_wrapper(
                         if _metrics["step_times"] else 0
                     ),
                     "peak_memory_mb": _metrics["peak_memory_mb"],
-                    "throughput_samples_sec": 0,  # computed from batch size
+                    "throughput_samples_sec": (
+                        _step_counter["count"] / sum(_metrics["step_times"])
+                        if _metrics["step_times"] else 0
+                    ),
                     "loss_values": _metrics["loss_values"],
                     "gradient_norms": _metrics["gradient_norms"],
                     "gradient_checksums": _metrics["gradient_checksums"],
                     "logit_signatures": _metrics["logit_signatures"],
                     "seed": VALIDATION_SEED,
                     "deterministic_validation": DETERMINISTIC_VALIDATION,
+                    "mode": MODE,
                     "applied_overrides": _CONFIG_OVERRIDES,
                     "runtime_error": _metrics["runtime_error"],
                 }}, f, indent=2)
@@ -221,11 +228,15 @@ def create_gradient_tracking_wrapper(
             _call_depth = [0]
             _compile_enabled = [_to_bool(_CONFIG_OVERRIDES.get("compile", False), False)]
             _amp_enabled = _to_bool(_CONFIG_OVERRIDES.get("amp", False), False)
+            _cuda_graphs_enabled = _to_bool(_CONFIG_OVERRIDES.get("cuda_graphs", False), False)
             _precision = str(_CONFIG_OVERRIDES.get("precision", "bf16")).lower()
             _checkpointing_enabled = _to_bool(
                 _CONFIG_OVERRIDES.get("gradient_checkpointing", False), False
             )
-            _compile_mode = str(_CONFIG_OVERRIDES.get("compile_mode", "default"))
+            _compile_mode = [str(_CONFIG_OVERRIDES.get("compile_mode", "default"))]
+            _compile_fallback_mode = str(
+                _CONFIG_OVERRIDES.get("compile_fallback_mode", "")
+            ).strip()
 
             def _maybe_apply_model_overrides(model):
                 if getattr(model, "_gpunity_overrides_applied", False):
@@ -240,9 +251,22 @@ def create_gradient_tracking_wrapper(
                 if _compile_enabled[0] and hasattr(torch, "compile"):
                     try:
                         model._gpunity_original_forward = model.forward
-                        model.forward = torch.compile(model.forward, mode=_compile_mode)
+                        model.forward = torch.compile(model.forward, mode=_compile_mode[0])
                     except Exception:
                         pass
+
+                if _cuda_graphs_enabled:
+                    if MODE != "infer":
+                        _CONFIG_OVERRIDES["_cuda_graphs_status"] = "disabled_non_inference_mode"
+                    elif not torch.cuda.is_available():
+                        _CONFIG_OVERRIDES["_cuda_graphs_status"] = "disabled_no_cuda"
+                    elif not hasattr(torch.cuda, "CUDAGraph"):
+                        _CONFIG_OVERRIDES["_cuda_graphs_status"] = "disabled_runtime_unsupported"
+                    else:
+                        # Generic graph capture requires shape-stable step functions and explicit
+                        # stream/capture management. The wrapper marks intent and defers to
+                        # workload-specific implementations if present in user code.
+                        _CONFIG_OVERRIDES["_cuda_graphs_status"] = "requested_generic_wrapper"
 
                 model._gpunity_overrides_applied = True
 
@@ -276,17 +300,47 @@ def create_gradient_tracking_wrapper(
                             out = _call_model()
                         except Exception as exc:
                             if _compile_enabled[0] and hasattr(self, "_gpunity_original_forward"):
-                                # Fallback: disable compile for this run and retry eagerly.
-                                self.forward = self._gpunity_original_forward
-                                _compile_enabled[0] = False
-                                _CONFIG_OVERRIDES["_compile_runtime_fallback"] = True
-                                out = _call_model()
+                                fallback_succeeded = False
+
+                                if (
+                                    _compile_fallback_mode
+                                    and _compile_fallback_mode != _compile_mode[0]
+                                    and hasattr(torch, "compile")
+                                ):
+                                    try:
+                                        self.forward = torch.compile(
+                                            self._gpunity_original_forward,
+                                            mode=_compile_fallback_mode,
+                                        )
+                                        _compile_mode[0] = _compile_fallback_mode
+                                        _CONFIG_OVERRIDES["_compile_runtime_fallback_mode"] = (
+                                            _compile_fallback_mode
+                                        )
+                                        out = _call_model()
+                                        fallback_succeeded = True
+                                    except Exception as fallback_exc:
+                                        _CONFIG_OVERRIDES["_compile_runtime_fallback_error"] = str(
+                                            fallback_exc
+                                        )
+
+                                if not fallback_succeeded:
+                                    # Final fallback: disable compile for this run and retry eagerly.
+                                    self.forward = self._gpunity_original_forward
+                                    _compile_enabled[0] = False
+                                    _CONFIG_OVERRIDES["_compile_runtime_fallback"] = True
+                                    out = _call_model()
                             else:
                                 raise exc
 
                         if _last_logits_signature[0] is None and isinstance(out, torch.Tensor):
                             if out.ndim >= 2:
                                 _last_logits_signature[0] = _tensor_signature(out)
+                        if MODE == "infer":
+                            now = time.perf_counter()
+                            if _last_step_time[0] is not None:
+                                _metrics["step_times"].append(now - _last_step_time[0])
+                            _last_step_time[0] = now
+                            _step_counter["count"] += 1
                         return out
 
                     return _orig_module_call(self, *args, **kwargs)

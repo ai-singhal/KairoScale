@@ -10,3 +10,9 @@ gpunity_report.md
 gpunity_configs/
 
 /.venv*/
+
+# Build / packaging artifacts (generated)
+build/
+dist/
+*.egg-info/
+.eggs/

@@ -1,0 +1,3 @@
+# Install project with all runtime integrations and developer tooling.
+# Includes: base deps + {claude, openai, modal, charts} + test deps.
+.[all,dev]

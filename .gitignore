@@ -1,7 +1,12 @@
 __pycache__/
+**/__pycache__/
+*__pycache__/
 *.py[cod]
 .pytest_cache/
+.env
 
 # Local GPUnity runtime artifacts
 gpunity_report.md
 gpunity_configs/
+
+/.venv*/

@@ -251,6 +251,10 @@ class ValidationResult:
     diverged: bool = False
     divergence_step: Optional[int] = None
     divergence_reason: str = ""
+    logits_checks_compared: int = 0
+    logits_max_abs_diff: Optional[float] = None
+    logits_mean_abs_diff: Optional[float] = None
+    logits_within_tolerance: Optional[bool] = None
 
 
 @dataclass
@@ -268,7 +272,12 @@ class RunConfig:
     max_configs: int = 10
     top_k: int = 5
     divergence_threshold: float = 0.8
+    logits_tolerance: float = 1e-3
     gradient_check_interval: int = 5
+    validation_seed: int = 1337
+    deterministic_validation: bool = True
+    validation_strategy: str = "parallel_all"
+    staged_top_k: int = 2
     max_cost_per_sandbox: float = 5.0
     output_path: str = "./gpunity_report.md"
     charts_mode: str = "ascii"

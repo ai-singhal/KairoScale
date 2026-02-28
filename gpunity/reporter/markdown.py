@@ -6,8 +6,11 @@ agent analysis, and validation results.
 
 from __future__ import annotations
 
+import difflib
+import json
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from gpunity.reporter.charts import (
     render_cosine_sim_chart,
@@ -34,6 +37,7 @@ def generate_report(
     control: ControlRun,
     results: list[ValidationResult],
     output_path: Path,
+    config_export_dir: Optional[Path] = None,
 ) -> Path:
     """Generate the full Markdown optimization report.
 
@@ -63,7 +67,7 @@ def generate_report(
     sections.append(_render_profile_analysis(profile))
 
     # Proposed Optimizations
-    sections.append(_render_proposed_optimizations(configs))
+    sections.append(_render_proposed_optimizations(configs, run_config, config_export_dir))
 
     # Validation Results (if not dry run)
     if results:
@@ -120,9 +124,11 @@ def _render_executive_summary(
 
     # Stats
     total = len(results)
-    succeeded = sum(1 for r in results if r.success)
+    succeeded = sum(1 for r in results if r.success and not r.diverged)
+    ran = sum(1 for r in results if r.success)
     diverged = sum(1 for r in results if r.diverged)
     lines.append(f"- {succeeded}/{total} configs validated successfully")
+    lines.append(f"- {ran}/{total} configs executed without runtime failure")
     if diverged:
         lines.append(f"- {diverged} config(s) showed divergence")
     else:
@@ -182,7 +188,30 @@ def _render_profile_analysis(profile: ProfileResult) -> str:
     return "\n".join(lines)
 
 
-def _render_proposed_optimizations(configs: list[OptimizationConfig]) -> str:
+def _build_code_diff(repo_root: Path, rel_path: str, new_content: str) -> str:
+    target = repo_root / rel_path
+    if target.exists() and target.is_file():
+        old_content = target.read_text(encoding="utf-8", errors="replace")
+    else:
+        old_content = ""
+    diff_lines = list(difflib.unified_diff(
+        old_content.splitlines(keepends=True),
+        new_content.splitlines(keepends=True),
+        fromfile=f"a/{rel_path}",
+        tofile=f"b/{rel_path}",
+    ))
+    if not diff_lines:
+        return "(no textual diff)"
+    if len(diff_lines) > 220:
+        diff_lines = diff_lines[:220] + ["... diff truncated ...\n"]
+    return "".join(diff_lines)
+
+
+def _render_proposed_optimizations(
+    configs: list[OptimizationConfig],
+    run_config: RunConfig,
+    config_export_dir: Optional[Path],
+) -> str:
     lines = ["## Proposed Optimizations\n"]
 
     if not configs:
@@ -223,6 +252,23 @@ def _render_proposed_optimizations(configs: list[OptimizationConfig]) -> str:
         if c.dependencies:
             lines.append(f"\n**Additional dependencies**: {', '.join(c.dependencies)}")
 
+        # Show reproducible config path + apply command
+        if config_export_dir is not None:
+            cfg_path = (Path(config_export_dir) / f"{c.id}.json").resolve()
+            lines.append(f"\n**Config JSON**: `{cfg_path}`")
+            lines.append(
+                f"**Apply command**: `gpunity apply {cfg_path} --repo {Path(run_config.repo_path).resolve()}`"
+            )
+
+        if c.code_changes:
+            lines.append("\n**Code diff(s)**:")
+            repo_root = Path(run_config.repo_path)
+            for rel_path, new_content in c.code_changes.items():
+                lines.append(f"\n`{rel_path}`")
+                lines.append("```diff")
+                lines.append(_build_code_diff(repo_root, rel_path, new_content))
+                lines.append("```")
+
     return "\n".join(lines)
 
 
@@ -262,6 +308,20 @@ def _render_validation_results(
     if cosine_sims:
         lines.append("### Gradient Similarity\n")
         lines.append(render_cosine_sim_chart(cosine_sims, run_config.divergence_threshold))
+
+    lines.append("### Correctness (Logit Signatures)\n")
+    for r in results:
+        if not r.success:
+            continue
+        if r.logits_checks_compared == 0:
+            lines.append(f"- **{r.config_name}**: no comparable logit signatures captured")
+            continue
+        status = "within tolerance" if r.logits_within_tolerance else "exceeded tolerance"
+        lines.append(
+            f"- **{r.config_name}**: checks={r.logits_checks_compared}, "
+            f"max_abs_diff={r.logits_max_abs_diff:.6f}, "
+            f"mean_abs_diff={r.logits_mean_abs_diff:.6f} ({status})"
+        )
 
     # Divergence flags
     diverged_results = [r for r in results if r.diverged]
@@ -363,7 +423,6 @@ def _render_appendix(
     for c in configs:
         lines.append(f"**{c.id}: {c.name}**\n")
         lines.append(f"```json")
-        import json
         lines.append(json.dumps(c.to_dict(), indent=2))
         lines.append(f"```\n")
 

@@ -6,6 +6,7 @@ Provides the `gpunity` command with subcommands: run, profile, analyze, validate
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -26,6 +27,15 @@ def main() -> None:
     pass
 
 
+def _export_configs(configs, output_dir: Path) -> Path:
+    """Persist generated configs to disk for reproducible application."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for cfg in configs:
+        cfg_path = output_dir / f"{cfg.id}.json"
+        cfg_path.write_text(json.dumps(cfg.to_dict(), indent=2), encoding="utf-8")
+    return output_dir
+
+
 @main.command()
 @click.argument("repo_path", type=click.Path(exists=True))
 @click.option("--entry", "entry_point", default="train.py", help="Training script entry point.")
@@ -43,8 +53,20 @@ def main() -> None:
 @click.option("--max-configs", default=10, type=int, help="Total configs to generate.")
 @click.option("--top-k", default=5, type=int, help="Configs to validate.")
 @click.option("--divergence-threshold", default=0.8, type=float, help="Cosine sim threshold.")
+@click.option("--logits-tolerance", default=1e-3, type=float,
+              help="Max allowed absolute logit signature delta vs control.")
 @click.option("--max-cost", "max_cost_per_sandbox", default=5.0, type=float,
               help="Cost ceiling per sandbox (USD).")
+@click.option("--validation-seed", default=1337, type=int,
+              help="Seed used for deterministic validation replay.")
+@click.option("--deterministic-validation/--no-deterministic-validation", default=True,
+              help="Enable deterministic validation seeding and dataloader patching.")
+@click.option("--validation-strategy",
+              default="parallel_all",
+              type=click.Choice(["parallel_all", "staged"]),
+              help="Validation fanout strategy across sandboxes.")
+@click.option("--staged-top-k", default=2, type=int,
+              help="For staged strategy: number of configs promoted to full validation.")
 @click.option("--output", "output_path", default="./gpunity_report.md",
               type=click.Path(), help="Report output path.")
 @click.option("--charts", "charts_mode", default="ascii", type=click.Choice(["ascii", "png"]),
@@ -130,6 +152,18 @@ def analyze(profile_dir: str, repo_path: str, **kwargs: object) -> None:
               help="Path to the repo.")
 @click.option("--validation-steps", default=50, type=int, help="Steps per validation run.")
 @click.option("--divergence-threshold", default=0.8, type=float, help="Cosine sim threshold.")
+@click.option("--logits-tolerance", default=1e-3, type=float,
+              help="Max allowed absolute logit signature delta vs control.")
+@click.option("--validation-seed", default=1337, type=int,
+              help="Seed used for deterministic validation replay.")
+@click.option("--deterministic-validation/--no-deterministic-validation", default=True,
+              help="Enable deterministic validation seeding and dataloader patching.")
+@click.option("--validation-strategy",
+              default="parallel_all",
+              type=click.Choice(["parallel_all", "staged"]),
+              help="Validation fanout strategy across sandboxes.")
+@click.option("--staged-top-k", default=2, type=int,
+              help="For staged strategy: number of configs promoted to full validation.")
 @click.option("--local", is_flag=True, help="Use local runner.")
 @click.option("--python-bin", default=None, type=click.Path(exists=True),
               help="Python binary for local wrapper execution.")
@@ -143,6 +177,25 @@ def validate(config_dir: str, repo_path: str, **kwargs: object) -> None:
     cli_args = {"repo_path": repo_path, **kwargs}
     config = load_config(cli_args)
     asyncio.run(run_validate_phase(config_dir, config))
+
+
+@main.command("apply")
+@click.argument("config_json", type=click.Path(exists=True))
+@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True),
+              help="Path to the repo where changes will be applied.")
+def apply_config_cmd(config_json: str, repo_path: str) -> None:
+    """Apply a saved optimization config JSON directly to a repository."""
+    from gpunity.types import OptimizationConfig
+    from gpunity.validator.patcher import apply_config_in_place
+
+    config_path = Path(config_json)
+    with open(config_path) as f:
+        config = OptimizationConfig.from_dict(json.load(f))
+
+    written = apply_config_in_place(Path(repo_path), config)
+    click.echo(f"Applied config {config.id} ({config.name}) to {repo_path}")
+    for path in written:
+        click.echo(f"  wrote: {path}")
 
 
 async def run_pipeline(config: RunConfig) -> Path:
@@ -173,6 +226,10 @@ async def run_pipeline(config: RunConfig) -> Path:
     from gpunity.agent.loop import run_agent_loop
     optimization_configs = await run_agent_loop(profile_result, Path(config.repo_path), config)
     logger.info(f"Phase 2 complete. Generated {len(optimization_configs)} configs.")
+    config_export_dir = _export_configs(
+        optimization_configs,
+        Path(config.output_path).parent / "gpunity_configs",
+    )
 
     # Phase 3: Validate (unless dry_run)
     control_run = None
@@ -204,6 +261,7 @@ async def run_pipeline(config: RunConfig) -> Path:
         control=control_run,
         results=validation_results,
         output_path=output_path,
+        config_export_dir=config_export_dir,
     )
     logger.info(f"Phase 4 complete. Report at: {report_path}")
 

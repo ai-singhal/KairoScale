@@ -2,7 +2,11 @@
 
 import math
 
-from gpunity.validator.divergence import check_divergence, compute_cosine_similarities
+from gpunity.validator.divergence import (
+    check_divergence,
+    compare_logit_signatures,
+    compute_cosine_similarities,
+)
 
 
 class TestCheckDivergence:
@@ -70,3 +74,26 @@ class TestComputeCosineSimilarities:
     def test_differentLengths(self):
         sims = compute_cosine_similarities([1.0, 0.9, 0.8], [1.0, 0.9])
         assert len(sims) == 2
+
+
+class TestCompareLogitSignatures:
+    def test_withinTolerance(self):
+        control = [{"logit_signature": {"mean": 1.0, "std": 2.0, "sample": [0.1, 0.2]}}]
+        variant = [{"logit_signature": {"mean": 1.0001, "std": 2.0001, "sample": [0.1, 0.2]}}]
+        checks, max_diff, mean_diff, failing_step = compare_logit_signatures(
+            control, variant, tolerance=1e-2
+        )
+        assert checks == 1
+        assert max_diff is not None and max_diff < 1e-2
+        assert mean_diff is not None
+        assert failing_step is None
+
+    def test_exceedsTolerance(self):
+        control = [{"logit_signature": {"mean": 1.0, "std": 2.0, "sample": [0.1, 0.2]}}]
+        variant = [{"logit_signature": {"mean": 1.5, "std": 2.0, "sample": [0.1, 0.2]}}]
+        checks, max_diff, mean_diff, failing_step = compare_logit_signatures(
+            control, variant, tolerance=1e-2
+        )
+        assert checks == 1
+        assert max_diff is not None and max_diff > 1e-2
+        assert failing_step == 0

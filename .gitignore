@@ -4,3 +4,4 @@ __pycache__/
 
 # Local GPUnity runtime artifacts
 gpunity_report.md
+gpunity_configs/

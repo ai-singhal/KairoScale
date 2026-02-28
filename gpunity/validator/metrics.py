@@ -91,10 +91,28 @@ def compute_validation_metrics(
 
     wall_clock = data.get("wall_clock_seconds", 0.0)
     avg_step_ms = data.get("avg_step_time_ms", 0.0)
+    steps_completed = data.get("steps_completed", 0)
     peak_mem = data.get("peak_memory_mb", 0.0)
     throughput = data.get("throughput_samples_sec", 0.0)
     loss_values = data.get("loss_values", [])
     cost = estimate_cost(gpu_type, wall_clock)
+    runtime_error = data.get("runtime_error")
+
+    if runtime_error:
+        return ValidationResult(
+            config_id=config_id,
+            config_name=config_name,
+            success=False,
+            error=f"Runtime error: {runtime_error}",
+        )
+
+    if steps_completed <= 0:
+        return ValidationResult(
+            config_id=config_id,
+            config_name=config_name,
+            success=False,
+            error="Run completed zero optimizer steps.",
+        )
 
     # Compute deltas vs control
     speedup = (control.avg_step_time_ms / avg_step_ms) if avg_step_ms > 0 else 1.0

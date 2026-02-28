@@ -26,3 +26,18 @@ def test_gradientTrackingWrapperHasFallbackEntryInvocation():
     assert "train" in script
     assert "main" in script
     assert "run" in script
+
+
+def test_gradientTrackingWrapperContainsDeterminismAndOverrides():
+    script = create_gradient_tracking_wrapper(
+        entry_point="train.py",
+        steps=10,
+        gradient_check_interval=2,
+        artifact_dir=Path("/tmp/gpunity_test"),
+        validation_seed=1234,
+        deterministic_validation=True,
+    )
+    assert "VALIDATION_SEED = 1234" in script
+    assert "DETERMINISTIC_VALIDATION = True" in script
+    assert ".gpunity_overrides.json" in script
+    assert "logit_signatures" in script

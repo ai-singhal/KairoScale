@@ -17,6 +17,8 @@ def create_gradient_tracking_wrapper(
     steps: int,
     gradient_check_interval: int,
     artifact_dir: Path,
+    validation_seed: int = 1337,
+    deterministic_validation: bool = True,
 ) -> str:
     """Generate a wrapper script that tracks gradients and metrics.
 
@@ -32,6 +34,8 @@ def create_gradient_tracking_wrapper(
         steps: Total training steps.
         gradient_check_interval: Steps between gradient checkpoints.
         artifact_dir: Directory for output artifacts.
+        validation_seed: Seed for deterministic replay.
+        deterministic_validation: Whether to enforce deterministic settings.
 
     Returns:
         Wrapper script content as a string.
@@ -43,16 +47,29 @@ def create_gradient_tracking_wrapper(
         import json
         import math
         import os
+        import random
         import sys
         import time
         from pathlib import Path
 
         ARTIFACT_DIR = Path(os.environ.get("ARTIFACT_DIR", "{artifact_dir}"))
         ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+        REPO_DIR = os.environ.get("REPO_DIR", os.getcwd())
 
         ENTRY_POINT = "{entry_point}"
         TOTAL_STEPS = {steps}
         GRADIENT_CHECK_INTERVAL = {gradient_check_interval}
+        VALIDATION_SEED = {validation_seed}
+        DETERMINISTIC_VALIDATION = {deterministic_validation}
+
+        _overrides_path = Path(REPO_DIR) / ".gpunity_overrides.json"
+        if _overrides_path.exists():
+            try:
+                _CONFIG_OVERRIDES = json.loads(_overrides_path.read_text())
+            except Exception:
+                _CONFIG_OVERRIDES = {{}}
+        else:
+            _CONFIG_OVERRIDES = {{}}
 
         # ------------------------------------------------------------------
         # Metrics collection
@@ -61,12 +78,15 @@ def create_gradient_tracking_wrapper(
             "loss_values": [],
             "gradient_norms": [],
             "gradient_checksums": [],
+            "logit_signatures": [],
             "step_times": [],
             "peak_memory_mb": 0.0,
+            "applied_overrides": _CONFIG_OVERRIDES,
+            "runtime_error": None,
         }}
 
-        _gradient_snapshots = []
         _step_counter = {{"count": 0}}
+        _last_logits_signature = [None]
 
         def _save_metrics():
             with open(ARTIFACT_DIR / "metrics.json", "w") as f:
@@ -82,7 +102,37 @@ def create_gradient_tracking_wrapper(
                     "loss_values": _metrics["loss_values"],
                     "gradient_norms": _metrics["gradient_norms"],
                     "gradient_checksums": _metrics["gradient_checksums"],
+                    "logit_signatures": _metrics["logit_signatures"],
+                    "seed": VALIDATION_SEED,
+                    "deterministic_validation": DETERMINISTIC_VALIDATION,
+                    "applied_overrides": _CONFIG_OVERRIDES,
+                    "runtime_error": _metrics["runtime_error"],
                 }}, f, indent=2)
+
+        def _to_bool(value, default=False):
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "on")
+            return default
+
+        def _tensor_signature(tensor):
+            try:
+                import torch
+                flat = tensor.detach().float().reshape(-1)
+                if flat.numel() == 0:
+                    return None
+                sample = flat[:8].tolist()
+                return {{
+                    "mean": float(flat.mean().item()),
+                    "std": float(flat.std(unbiased=False).item()),
+                    "min": float(flat.min().item()),
+                    "max": float(flat.max().item()),
+                    "l2": float(torch.norm(flat, p=2).item()),
+                    "sample": [float(x) for x in sample],
+                }}
+            except Exception:
+                return None
 
         # ------------------------------------------------------------------
         # Monkey-patches for tracking
@@ -90,6 +140,51 @@ def create_gradient_tracking_wrapper(
         try:
             import torch
             import torch.optim as _toptim
+            import torch.nn.functional as _F
+            import torch.utils.data as _tud
+
+            # Deterministic setup (same seed + algorithm preferences).
+            random.seed(VALIDATION_SEED)
+            os.environ["PYTHONHASHSEED"] = str(VALIDATION_SEED)
+            try:
+                import numpy as _np
+                _np.random.seed(VALIDATION_SEED)
+            except Exception:
+                pass
+            torch.manual_seed(VALIDATION_SEED)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(VALIDATION_SEED)
+
+            if DETERMINISTIC_VALIDATION:
+                try:
+                    torch.use_deterministic_algorithms(True, warn_only=True)
+                except Exception:
+                    pass
+                if hasattr(torch.backends, "cudnn"):
+                    torch.backends.cudnn.deterministic = True
+                    torch.backends.cudnn.benchmark = False
+
+            # DataLoader patch for deterministic replay and runtime overrides.
+            _OriginalDataLoader = _tud.DataLoader
+            _loader_seed_gen = torch.Generator()
+            _loader_seed_gen.manual_seed(VALIDATION_SEED)
+
+            class _GPUnityDataLoader(_OriginalDataLoader):
+                def __init__(self, *args, **kwargs):
+                    if "dataloader_num_workers" in _CONFIG_OVERRIDES:
+                        kwargs["num_workers"] = int(_CONFIG_OVERRIDES["dataloader_num_workers"])
+                    elif DETERMINISTIC_VALIDATION and "num_workers" not in kwargs:
+                        kwargs["num_workers"] = 0
+
+                    if "dataloader_pin_memory" in _CONFIG_OVERRIDES:
+                        kwargs["pin_memory"] = _to_bool(_CONFIG_OVERRIDES["dataloader_pin_memory"])
+
+                    if DETERMINISTIC_VALIDATION and "generator" not in kwargs:
+                        kwargs["generator"] = _loader_seed_gen
+
+                    super().__init__(*args, **kwargs)
+
+            _tud.DataLoader = _GPUnityDataLoader
 
             # Patch optimizer.step to count steps and time them
             _last_step_time = [None]
@@ -121,6 +216,101 @@ def create_gradient_tracking_wrapper(
                 ):
                     _patch_optimizer_step(_obj)
 
+            # Top-level model-call patch for overrides (compile, amp, checkpointing).
+            _orig_module_call = torch.nn.Module.__call__
+            _call_depth = [0]
+            _compile_enabled = [_to_bool(_CONFIG_OVERRIDES.get("compile", False), False)]
+            _amp_enabled = _to_bool(_CONFIG_OVERRIDES.get("amp", False), False)
+            _precision = str(_CONFIG_OVERRIDES.get("precision", "bf16")).lower()
+            _checkpointing_enabled = _to_bool(
+                _CONFIG_OVERRIDES.get("gradient_checkpointing", False), False
+            )
+            _compile_mode = str(_CONFIG_OVERRIDES.get("compile_mode", "default"))
+
+            def _maybe_apply_model_overrides(model):
+                if getattr(model, "_gpunity_overrides_applied", False):
+                    return
+
+                if _checkpointing_enabled and hasattr(model, "gradient_checkpointing_enable"):
+                    try:
+                        model.gradient_checkpointing_enable()
+                    except Exception:
+                        pass
+
+                if _compile_enabled[0] and hasattr(torch, "compile"):
+                    try:
+                        model._gpunity_original_forward = model.forward
+                        model.forward = torch.compile(model.forward, mode=_compile_mode)
+                    except Exception:
+                        pass
+
+                model._gpunity_overrides_applied = True
+
+            def _patched_module_call(self, *args, **kwargs):
+                _call_depth[0] += 1
+                is_top = _call_depth[0] == 1
+                try:
+                    if is_top:
+                        _maybe_apply_model_overrides(self)
+
+                        def _call_model():
+                            if _amp_enabled:
+                                device_type = "cuda" if torch.cuda.is_available() else "cpu"
+                                dtype = torch.bfloat16
+                                if _precision in ("fp16", "float16"):
+                                    dtype = torch.float16
+                                elif _precision in ("bf16", "bfloat16"):
+                                    dtype = torch.bfloat16
+                                if device_type == "cpu" and dtype == torch.float16:
+                                    dtype = torch.bfloat16
+
+                                with torch.autocast(
+                                    device_type=device_type,
+                                    dtype=dtype,
+                                    enabled=True,
+                                ):
+                                    return _orig_module_call(self, *args, **kwargs)
+                            return _orig_module_call(self, *args, **kwargs)
+
+                        try:
+                            out = _call_model()
+                        except Exception as exc:
+                            if _compile_enabled[0] and hasattr(self, "_gpunity_original_forward"):
+                                # Fallback: disable compile for this run and retry eagerly.
+                                self.forward = self._gpunity_original_forward
+                                _compile_enabled[0] = False
+                                _CONFIG_OVERRIDES["_compile_runtime_fallback"] = True
+                                out = _call_model()
+                            else:
+                                raise exc
+
+                        if _last_logits_signature[0] is None and isinstance(out, torch.Tensor):
+                            if out.ndim >= 2:
+                                _last_logits_signature[0] = _tensor_signature(out)
+                        return out
+
+                    return _orig_module_call(self, *args, **kwargs)
+                finally:
+                    _call_depth[0] -= 1
+
+            torch.nn.Module.__call__ = _patched_module_call
+
+            # Capture logits from common loss APIs.
+            _orig_ce = _F.cross_entropy
+
+            def _tracked_cross_entropy(input, *args, **kwargs):
+                _last_logits_signature[0] = _tensor_signature(input)
+                return _orig_ce(input, *args, **kwargs)
+
+            _F.cross_entropy = _tracked_cross_entropy
+
+            _orig_bce_logits = getattr(_F, "binary_cross_entropy_with_logits", None)
+            if _orig_bce_logits is not None:
+                def _tracked_bce_logits(input, *args, **kwargs):
+                    _last_logits_signature[0] = _tensor_signature(input)
+                    return _orig_bce_logits(input, *args, **kwargs)
+                _F.binary_cross_entropy_with_logits = _tracked_bce_logits
+
             # Patch loss.backward to capture loss value
             _OrigBackward = torch.Tensor.backward
 
@@ -131,6 +321,14 @@ def create_gradient_tracking_wrapper(
                         _metrics["loss_values"].append(loss_val)
                     else:
                         _metrics["loss_values"].append(float("nan"))
+                except Exception:
+                    pass
+                try:
+                    if _last_logits_signature[0] is not None:
+                        _metrics["logit_signatures"].append(_last_logits_signature[0])
+                        _last_logits_signature[0] = None
+                    else:
+                        _metrics["logit_signatures"].append(None)
                 except Exception:
                     pass
                 return _OrigBackward(self, *args, **kwargs)
@@ -146,7 +344,7 @@ def create_gradient_tracking_wrapper(
         def run_validation():
             import importlib.util
 
-            repo_dir = os.environ.get("REPO_DIR", os.getcwd())
+            repo_dir = REPO_DIR
             sys.path.insert(0, repo_dir)
             os.environ["TRAIN_STEPS"] = str(TOTAL_STEPS)
 
@@ -172,6 +370,7 @@ def create_gradient_tracking_wrapper(
                     _invoke_fallback_entry(module)
             except Exception as e:
                 print(f"[gpunity] Training error: {{e}}")
+                _metrics["runtime_error"] = str(e)
                 import traceback
                 traceback.print_exc()
 
@@ -224,6 +423,7 @@ def load_gradient_checkpoints(artifact_dir: Path) -> list[dict[str, Any]]:
 
     loss_values = data.get("loss_values", [])
     grad_norms = data.get("gradient_norms", [])
+    logit_signatures = data.get("logit_signatures", [])
 
     checkpoints = []
     for i, loss in enumerate(loss_values):
@@ -233,6 +433,8 @@ def load_gradient_checkpoints(artifact_dir: Path) -> list[dict[str, Any]]:
         }
         if i < len(grad_norms):
             checkpoint["gradient_norm"] = grad_norms[i]
+        if i < len(logit_signatures):
+            checkpoint["logit_signature"] = logit_signatures[i]
         checkpoints.append(checkpoint)
 
     return checkpoints

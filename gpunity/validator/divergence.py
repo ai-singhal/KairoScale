@@ -130,3 +130,52 @@ def compute_cosine_similarities(
         similarities.append(min(1.0, sim))
 
     return similarities
+
+
+def compare_logit_signatures(
+    control_grads: list[dict[str, Any]],
+    variant_grads: list[dict[str, Any]],
+    tolerance: float,
+) -> tuple[int, Optional[float], Optional[float], Optional[int]]:
+    """Compare per-step logit signatures between control and variant runs.
+
+    The wrapper stores lightweight signatures (mean/std/min/max/l2/sample)
+    instead of raw logits. This function computes absolute deltas across shared
+    keys and returns aggregate differences.
+
+    Returns:
+        (checks_compared, max_abs_diff, mean_abs_diff, first_failing_step)
+    """
+    comparable_diffs: list[tuple[int, float]] = []
+    min_len = min(len(control_grads), len(variant_grads))
+
+    for i in range(min_len):
+        ctrl_sig = control_grads[i].get("logit_signature")
+        var_sig = variant_grads[i].get("logit_signature")
+        if not isinstance(ctrl_sig, dict) or not isinstance(var_sig, dict):
+            continue
+
+        diffs: list[float] = []
+        for key in ("mean", "std", "min", "max", "l2"):
+            c_val = ctrl_sig.get(key)
+            v_val = var_sig.get(key)
+            if isinstance(c_val, (int, float)) and isinstance(v_val, (int, float)):
+                diffs.append(abs(float(c_val) - float(v_val)))
+
+        c_sample = ctrl_sig.get("sample")
+        v_sample = var_sig.get("sample")
+        if isinstance(c_sample, list) and isinstance(v_sample, list):
+            for c_val, v_val in zip(c_sample, v_sample):
+                if isinstance(c_val, (int, float)) and isinstance(v_val, (int, float)):
+                    diffs.append(abs(float(c_val) - float(v_val)))
+
+        if diffs:
+            comparable_diffs.append((i, max(diffs)))
+
+    if not comparable_diffs:
+        return 0, None, None, None
+
+    max_diff = max(d for _, d in comparable_diffs)
+    mean_diff = sum(d for _, d in comparable_diffs) / len(comparable_diffs)
+    first_failing_step = next((step for step, d in comparable_diffs if d > tolerance), None)
+    return len(comparable_diffs), max_diff, mean_diff, first_failing_step

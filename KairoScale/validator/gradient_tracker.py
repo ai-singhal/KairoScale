@@ -292,8 +292,39 @@ def create_gradient_tracking_wrapper(
             # Fused optimizer override
             _optimizer_strategy = str(_CONFIG_OVERRIDES.get("optimizer_strategy", "")).lower()
             if _optimizer_strategy == "fused_triton_search":
-                _OrigAdamW = getattr(_toptim, "AdamW", None)
-                _OrigAdam = getattr(_toptim, "Adam", None)
+                # Determine which optimizer candidate to use
+                _optimizer_candidates = _CONFIG_OVERRIDES.get("optimizer_candidates", [])
+                _selected_optimizer = str(
+                    _CONFIG_OVERRIDES.get("optimizer_selected", "")
+                ).lower()
+
+                # ----------------------------------------------------------
+                # HuggingFace optimizers for AdamW, SGD, RMSProp
+                # ----------------------------------------------------------
+                _hf_available = False
+                try:
+                    from transformers.optimization import AdamW as _HFAdamW
+                    _hf_available = True
+                except Exception:
+                    pass
+
+                if _hf_available:
+                    _OrigAdamW = getattr(_toptim, "AdamW", None)
+                    if _OrigAdamW is not None:
+                        class _HFAdamWWrapper(_HFAdamW):
+                            def __init__(self, params, **kwargs):
+                                kwargs.pop("fused", None)
+                                kwargs.pop("foreach", None)
+                                kwargs.pop("amsgrad", None)
+                                super().__init__(params, **kwargs)
+                                _CONFIG_OVERRIDES["_optimizer_swap_applied"] = "HF_AdamW"
+                        _HFAdamWWrapper.__name__ = "AdamW"
+                        _HFAdamWWrapper.__qualname__ = "AdamW"
+                        _toptim.AdamW = _HFAdamWWrapper
+
+                # For SGD and RMSProp, use torch fused=True (HF doesn't ship these)
+                _OrigSGD = getattr(_toptim, "SGD", None)
+                _OrigRMSprop = getattr(_toptim, "RMSprop", None)
 
                 def _make_fused_wrapper(orig_cls):
                     class _FusedOptimizer(orig_cls):
@@ -309,10 +340,45 @@ def create_gradient_tracking_wrapper(
                     _FusedOptimizer.__qualname__ = orig_cls.__qualname__
                     return _FusedOptimizer
 
-                if _OrigAdamW is not None:
-                    _toptim.AdamW = _make_fused_wrapper(_OrigAdamW)
-                if _OrigAdam is not None:
-                    _toptim.Adam = _make_fused_wrapper(_OrigAdam)
+                if _OrigSGD is not None:
+                    _toptim.SGD = _make_fused_wrapper(_OrigSGD)
+                if _OrigRMSprop is not None:
+                    _toptim.RMSprop = _make_fused_wrapper(_OrigRMSprop)
+
+                # ----------------------------------------------------------
+                # Triton-based Adafactor & MUON
+                # ----------------------------------------------------------
+                _triton_adafactor_cls = None
+                _triton_muon_cls = None
+                try:
+                    from KairoScale.optimizer.triton_adafactor import TritonAdafactor
+                    _triton_adafactor_cls = TritonAdafactor
+                except Exception:
+                    pass
+                try:
+                    from KairoScale.optimizer.triton_muon import TritonMuon
+                    _triton_muon_cls = TritonMuon
+                except Exception:
+                    pass
+
+                # Expose Triton optimizers under torch.optim for easy swap-in
+                if _triton_adafactor_cls is not None:
+                    _toptim.Adafactor = _triton_adafactor_cls
+                    _CONFIG_OVERRIDES["_triton_adafactor_available"] = True
+                if _triton_muon_cls is not None:
+                    _toptim.Muon = _triton_muon_cls
+                    _CONFIG_OVERRIDES["_triton_muon_available"] = True
+
+                # If a specific optimizer was pre-selected, monkey-patch
+                # the default AdamW/Adam to use it instead
+                if _selected_optimizer == "adafactor" and _triton_adafactor_cls is not None:
+                    _toptim.AdamW = _triton_adafactor_cls
+                    _toptim.Adam = _triton_adafactor_cls
+                    _CONFIG_OVERRIDES["_optimizer_swap_applied"] = "TritonAdafactor"
+                elif _selected_optimizer == "muon" and _triton_muon_cls is not None:
+                    _toptim.AdamW = _triton_muon_cls
+                    _toptim.Adam = _triton_muon_cls
+                    _CONFIG_OVERRIDES["_optimizer_swap_applied"] = "TritonMuon"
 
             # Top-level model-call patch for overrides (compile, amp, checkpointing).
             _orig_module_call = torch.nn.Module.__call__

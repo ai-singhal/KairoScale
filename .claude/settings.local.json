@@ -7,7 +7,8 @@
       "Bash(.venv/Scripts/python:*)",
       "WebSearch",
       "Bash(python:*)",
-      "Bash(pkill:*)"
+      "Bash(pkill:*)",
+      "Bash(python3:*)"
     ]
   }
 }

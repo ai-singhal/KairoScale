@@ -12,6 +12,7 @@ from gpunity.agent.prompts import get_system_prompt
 from gpunity.agent.tools import execute_tool, get_agent_tools
 from gpunity.optimizer.policy import apply_hardware_priors
 from gpunity.types import (
+    CodeReference,
     HardwareProfile,
     OptimizationConfig,
     OptimizationType,
@@ -36,10 +37,6 @@ def _get_provider(config: RunConfig):
         from gpunity.agent.providers.openai_provider import OpenAIProvider
 
         return OpenAIProvider(model=config.model or "gpt-5.2")
-    if config.provider == "custom":
-        from gpunity.agent.providers.openai_provider import OpenAIProvider
-
-        return OpenAIProvider(model=config.model or "gpt-5.2-mini")
     if config.provider == "modal":
         from gpunity.agent.providers.modal_provider import ModalProvider
 
@@ -142,6 +139,15 @@ async def run_agent_loop(
                     result_data = json.loads(result)
                     if result_data.get("status") == "accepted":
                         config_counter += 1
+                        raw_refs = tool_input.get("code_refs", [])
+                        parsed_code_refs = [
+                            CodeReference(
+                                file=r["file"],
+                                line=r["line"],
+                                snippet=r.get("snippet", ""),
+                            )
+                            for r in raw_refs
+                        ]
                         collected_configs.append(
                             OptimizationConfig(
                                 id=f"opt-{config_counter:03d}",
@@ -155,6 +161,7 @@ async def run_agent_loop(
                                 estimated_memory_delta=tool_input.get("estimated_memory_delta", 0.0),
                                 risk_level=RiskLevel(tool_input.get("risk_level", "medium")),
                                 dependencies=tool_input.get("dependencies", []),
+                                code_refs=parsed_code_refs,
                             )
                         )
                 except (json.JSONDecodeError, KeyError) as e:

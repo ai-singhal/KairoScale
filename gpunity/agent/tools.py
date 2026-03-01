@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from gpunity.types import (
+    CodeReference,
     OptimizationConfig,
     OptimizationType,
     ProfileResult,
@@ -123,6 +124,19 @@ def get_agent_tools(profile: ProfileResult, repo_path: Path) -> list[dict[str, A
                         "items": {"type": "string"},
                         "description": "Additional pip packages needed.",
                     },
+                    "code_refs": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": {"type": "string", "description": "Relative file path from search_code() result."},
+                                "line": {"type": "integer", "description": "Line number from search_code() result."},
+                                "snippet": {"type": "string", "description": "The matched code line."},
+                            },
+                            "required": ["file", "line"],
+                        },
+                        "description": "Source code locations from search_code() that justify this optimization. Include at least one per proposal.",
+                    },
                 },
                 "required": [
                     "name", "description", "optimization_type",
@@ -214,6 +228,15 @@ def execute_tool(
     elif tool_name == "propose_config":
         # Validate and return confirmation
         try:
+            raw_refs = tool_input.get("code_refs", [])
+            parsed_code_refs = [
+                CodeReference(
+                    file=r["file"],
+                    line=r["line"],
+                    snippet=r.get("snippet", ""),
+                )
+                for r in raw_refs
+            ]
             config = OptimizationConfig(
                 id="",  # Will be assigned later
                 name=tool_input["name"],
@@ -226,6 +249,7 @@ def execute_tool(
                 estimated_memory_delta=tool_input.get("estimated_memory_delta", 0.0),
                 risk_level=RiskLevel(tool_input.get("risk_level", "medium")),
                 dependencies=tool_input.get("dependencies", []),
+                code_refs=parsed_code_refs,
             )
             return json.dumps({
                 "status": "accepted",

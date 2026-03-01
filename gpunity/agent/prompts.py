@@ -75,6 +75,12 @@ WORKFLOW:
 4. Use search_code() to find specific patterns (e.g., attention implementation, data loading).
 5. For each optimization idea, call propose_config() with a complete configuration.
 
+EVIDENCE REQUIREMENTS:
+- For every propose_config() call, you MUST include at least one code_refs entry.
+- Get code_refs by calling search_code() first and using the file:line results.
+- Format: {{"file": "train.py", "line": 42, "snippet": "DataLoader(dataset, num_workers=0)"}}
+- Proposals without code_refs are treated as lower confidence.
+
 PROFILE DATA:
 {profile_summary}
 {bottleneck_section}
@@ -92,7 +98,8 @@ EXAMPLE of a good proposal:
   "config_overrides": {{"compile": true, "compile_mode": "reduce-overhead"}},
   "estimated_speedup": 1.3,
   "estimated_memory_delta": -0.05,
-  "risk_level": "low"
+  "risk_level": "low",
+  "code_refs": [{{"file": "train.py", "line": 15, "snippet": "model = GPT(config)"}}]
 }}
 
 Generate at least 2 and at most 10 diverse optimization proposals. Focus on the highest-impact changes first."""

@@ -34,6 +34,8 @@ async def run_in_modal(
     timeout_seconds: int = 600,
     cost_ceiling_usd: float = 5.0,
     extra_deps: Optional[list[str]] = None,
+    stream_logs: bool = False,
+    persist_volume_name: Optional[str] = None,
 ) -> Path:
     """Run a script in a Modal sandbox with GPU.
 
@@ -47,6 +49,8 @@ async def run_in_modal(
         timeout_seconds: Maximum execution time.
         cost_ceiling_usd: Maximum cost allowed (not enforced yet).
         extra_deps: Additional pip packages to install.
+        stream_logs: If True, print sandbox stdout to the terminal.
+        persist_volume_name: Optional Modal Volume name to persist artifacts.
 
     Returns:
         Local path to downloaded artifacts directory.
@@ -93,6 +97,12 @@ async def run_in_modal(
     # Determine Modal GPU config
     modal_gpu = _MODAL_GPU_MAP.get(gpu_type, "A100")
 
+    # Optional persistent volume for deploy runs
+    volume_mounts = {}
+    if persist_volume_name:
+        vol = modal.Volume.from_name(persist_volume_name, create_if_missing=True)
+        volume_mounts = {"/output": vol}
+
     logger.info(f"Creating Modal sandbox with {modal_gpu} GPU")
     logger.info(f"Timeout: {timeout_seconds}s, Cost ceiling: ${cost_ceiling_usd}")
 
@@ -124,6 +134,7 @@ async def run_in_modal(
                 "PYTHONPATH": "/root/repo",
             },
             app=app,
+            **({"volumes": volume_mounts} if volume_mounts else {}),
         )
 
         # Wait for the wrapper script to complete while keeping sandbox alive.
@@ -156,6 +167,14 @@ async def run_in_modal(
                 f"Could not parse wrapper exit code from {wrapper_exit_code_file}: {wrapper_exit_code_raw!r}"
             ) from exc
 
+        if stream_logs:
+            try:
+                stdout_content = await sb.stdout.read.aio()
+                if stdout_content:
+                    print(stdout_content)
+            except Exception:
+                pass
+
         # Download artifacts from sandbox (use async file APIs for Modal>=1.x)
         artifact_items = await sb.ls.aio(sandbox_artifact_dir)
         for item in artifact_items:
@@ -173,6 +192,16 @@ async def run_in_modal(
             except Exception:
                 # Skip non-regular files.
                 continue
+
+        # Persist to Modal Volume if requested
+        if persist_volume_name:
+            try:
+                copy_cmd = f"cp -r {sandbox_artifact_dir}/* /output/ 2>/dev/null; cp -r /root/repo /output/repo 2>/dev/null"
+                copy_proc = await sb.exec.aio("bash", "-c", copy_cmd)
+                await copy_proc.wait.aio()
+                logger.info(f"Persisted artifacts to Modal Volume: {persist_volume_name}")
+            except Exception as e:
+                logger.warning(f"Failed to persist to volume: {e}")
 
         # Terminate the sleep process, then read full logs.
         await sb.terminate.aio()

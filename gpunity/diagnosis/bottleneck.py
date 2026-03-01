@@ -95,6 +95,16 @@ def diagnose_bottleneck(
                 evidence.append(
                     f"CPU data pipeline time = {profile.cpu_data_pipeline_ms:.1f} ms/step"
                 )
+            if hasattr(profile, 'dataloader_num_workers') and profile.dataloader_num_workers == 0:
+                evidence.append(
+                    "num_workers=0: all data loading is synchronous on the main process. "
+                    "Set num_workers=4-8 to parallelize data loading across CPU cores."
+                )
+            if hasattr(profile, 'dataloader_pin_memory') and not profile.dataloader_pin_memory:
+                evidence.append(
+                    "pin_memory=False: no DMA transfer overlap for CPU→GPU data movement. "
+                    "Enable pin_memory=True to use page-locked memory for async transfers."
+                )
             confidence = "high" if stall_ratio > 0.50 else "medium"
             candidates.append((BottleneckType.DATA_STARVED, confidence, evidence))
 
@@ -167,7 +177,40 @@ def diagnose_bottleneck(
                 "No data starvation, VRAM pressure, or transfer bottlenecks detected"
             )
         confidence = "high" if gpu_active > 0.90 else "medium"
+
+        # Upgrade confidence and add FLOP utilization evidence when available
+        flop_util = getattr(profile, "flop_utilization", None)
+        if flop_util is not None:
+            if flop_util > 0.6:
+                confidence = "high"
+                evidence.append(
+                    f"FLOP utilization = {flop_util:.1%} of GPU peak (near peak throughput)"
+                )
+            elif flop_util < 0.3 and gpu_active > _GPU_ACTIVE_HIGH:
+                # GPU appears busy but FLOPs are low → kernel launch overhead
+                evidence.append(
+                    f"FLOP utilization = {flop_util:.1%} of GPU peak despite high GPU active "
+                    f"ratio — likely kernel launch overhead or small, memory-bound kernels"
+                )
+
         candidates.append((BottleneckType.COMPUTE_BOUND, confidence, evidence))
+
+    # Kernel launch overhead: GPU active but FLOP utilization is very low
+    flop_util = getattr(profile, "flop_utilization", None)
+    if (
+        flop_util is not None
+        and flop_util < 0.3
+        and profile.gpu_utilization > 50
+        and gpu_active <= _GPU_ACTIVE_HIGH
+    ):
+        evidence = [
+            f"FLOP utilization = {flop_util:.1%} of GPU peak",
+            f"GPU utilization = {profile.gpu_utilization:.1f}% (active but compute-inefficient)",
+            "Low FLOP utilization with moderate GPU activity suggests kernel launch overhead "
+            "or many small, memory-bound kernels",
+            "Source: torch.profiler with_flops=True + CUDA time",
+        ]
+        candidates.append((BottleneckType.COMPUTE_BOUND, "medium", evidence))
 
     # Select primary and secondary
     if not candidates:

@@ -207,6 +207,19 @@ def create_gradient_tracking_wrapper(
                     if "dataloader_pin_memory" in _CONFIG_OVERRIDES:
                         kwargs["pin_memory"] = _to_bool(_CONFIG_OVERRIDES["dataloader_pin_memory"])
 
+                    if "dataloader_prefetch_factor" in _CONFIG_OVERRIDES:
+                        pf = int(_CONFIG_OVERRIDES["dataloader_prefetch_factor"])
+                        # prefetch_factor requires num_workers > 0
+                        nw = kwargs.get("num_workers", 0)
+                        if nw > 0:
+                            kwargs["prefetch_factor"] = pf
+
+                    if "dataloader_persistent_workers" in _CONFIG_OVERRIDES:
+                        pw = _to_bool(_CONFIG_OVERRIDES["dataloader_persistent_workers"])
+                        nw = kwargs.get("num_workers", 0)
+                        if nw > 0:
+                            kwargs["persistent_workers"] = pw
+
                     if DETERMINISTIC_VALIDATION and "generator" not in kwargs:
                         kwargs["generator"] = _loader_seed_gen
 
@@ -276,6 +289,31 @@ def create_gradient_tracking_wrapper(
                 ):
                     _patch_optimizer_step(_obj)
 
+            # Fused optimizer override
+            _optimizer_strategy = str(_CONFIG_OVERRIDES.get("optimizer_strategy", "")).lower()
+            if _optimizer_strategy == "fused_triton_search":
+                _OrigAdamW = getattr(_toptim, "AdamW", None)
+                _OrigAdam = getattr(_toptim, "Adam", None)
+
+                def _make_fused_wrapper(orig_cls):
+                    class _FusedOptimizer(orig_cls):
+                        def __init__(self, params, **kwargs):
+                            try:
+                                kwargs["fused"] = True
+                                super().__init__(params, **kwargs)
+                                _CONFIG_OVERRIDES["_optimizer_fused_applied"] = orig_cls.__name__
+                            except Exception:
+                                kwargs.pop("fused", None)
+                                super().__init__(params, **kwargs)
+                    _FusedOptimizer.__name__ = orig_cls.__name__
+                    _FusedOptimizer.__qualname__ = orig_cls.__qualname__
+                    return _FusedOptimizer
+
+                if _OrigAdamW is not None:
+                    _toptim.AdamW = _make_fused_wrapper(_OrigAdamW)
+                if _OrigAdam is not None:
+                    _toptim.Adam = _make_fused_wrapper(_OrigAdam)
+
             # Top-level model-call patch for overrides (compile, amp, checkpointing).
             _orig_module_call = torch.nn.Module.__call__
             _call_depth = [0]
@@ -328,6 +366,22 @@ def create_gradient_tracking_wrapper(
                         # stream/capture management. The wrapper marks intent and defers to
                         # workload-specific implementations if present in user code.
                         _CONFIG_OVERRIDES["_cuda_graphs_status"] = "requested_generic_wrapper"
+
+                # Attention backend override
+                _attention_backend = str(_CONFIG_OVERRIDES.get("attention_backend", "")).lower()
+                if _attention_backend == "flash":
+                    try:
+                        if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+                            _orig_sdpa = torch.nn.functional.scaled_dot_product_attention
+                            def _flash_sdpa(query, key, value, **sdpa_kwargs):
+                                with torch.backends.cuda.sdp_kernel(
+                                    enable_flash=True, enable_math=False, enable_mem_efficient=False
+                                ):
+                                    return _orig_sdpa(query, key, value, **sdpa_kwargs)
+                            torch.nn.functional.scaled_dot_product_attention = _flash_sdpa
+                            _CONFIG_OVERRIDES["_attention_backend_applied"] = "sdpa_flash"
+                    except Exception as e:
+                        _CONFIG_OVERRIDES["_attention_backend_error"] = str(e)
 
                 model._gpunity_overrides_applied = True
 

@@ -353,6 +353,12 @@ def _render_proposed_optimizations(
         for ev in c.evidence:
             lines.append(f"- {ev}")
 
+        if hasattr(c, 'code_refs') and c.code_refs:
+            lines.append("\n**Source references**:")
+            for ref in c.code_refs:
+                snippet_text = f" — `{ref.snippet}`" if ref.snippet else ""
+                lines.append(f"- `{ref.file}:{ref.line}`{snippet_text}")
+
         if c.config_overrides:
             lines.append(f"\n**Config overrides**: `{c.config_overrides}`")
         if c.dependencies:
@@ -488,6 +494,11 @@ def _render_evidence_tracebacks(
                 lines.append(f"- {ev}")
         else:
             lines.append("- No evidence chain captured.")
+        if cfg is not None and hasattr(cfg, 'code_refs') and cfg.code_refs:
+            lines.append("\n**Source code references**")
+            for ref in cfg.code_refs:
+                snippet_text = f" — `{ref.snippet}`" if ref.snippet else ""
+                lines.append(f"- `{ref.file}:{ref.line}`{snippet_text}")
 
         lines.append("\n**Validation block**")
         lines.append(f"- Diverged: {'YES' if r.diverged else 'No'}")

@@ -126,7 +126,7 @@ def create_profiling_wrapper(
         # ------------------------------------------------------------------
         # DataLoader monkey-patch for throughput tracking
         # ------------------------------------------------------------------
-        _dl_stats = {{"stall_times": [], "batch_times": [], "sample_counts": []}}
+        _dl_stats = {{"stall_times": [], "batch_times": [], "sample_counts": [], "num_workers": 0, "pin_memory": False}}
 
         try:
             import torch
@@ -135,6 +135,12 @@ def create_profiling_wrapper(
             _OriginalDataLoader = _tud.DataLoader
 
             class _InstrumentedDataLoader(_OriginalDataLoader):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    # Capture DataLoader config for profiling
+                    _dl_stats["num_workers"] = getattr(self, "num_workers", 0)
+                    _dl_stats["pin_memory"] = getattr(self, "pin_memory", False)
+
                 def __iter__(self):
                     it = super().__iter__()
                     while True:
@@ -216,6 +222,7 @@ def create_profiling_wrapper(
         # Step counter injected via optimizer.step monkey-patch
         # ------------------------------------------------------------------
         _step_counter = {{"count": 0, "step_times": [], "last_step_time": None}}
+        _profiler_ctx_ref = [None]  # Set during run_profiling() so optimizer patch can call .step()
 
         try:
             import torch
@@ -235,6 +242,12 @@ def create_profiling_wrapper(
                         _step_counter["step_times"].append(now - _step_counter["last_step_time"])
                     _step_counter["last_step_time"] = now
                     _step_counter["count"] += 1
+                    # Advance torch.profiler schedule each optimizer step
+                    if _profiler_ctx_ref[0] is not None:
+                        try:
+                            _profiler_ctx_ref[0].step()
+                        except Exception:
+                            pass
                     return result
 
                 _counted_step._gpunity_patched = True
@@ -281,10 +294,13 @@ def create_profiling_wrapper(
                 "peak_allocation_stack": "",
                 "forward_time_ms": 0.0,
                 "backward_time_ms": 0.0,
+                "fwd_bwd_split_method": "estimated",
                 "backward_ops": [],
                 "dataloader_throughput": 0.0,
                 "dataloader_stall_time_ms": 0.0,
                 "dataloader_bottleneck": False,
+                "dataloader_num_workers": 0,
+                "dataloader_pin_memory": False,
                 "h2d_transfer_time_ms": 0.0,
                 "compile_warmup_time_s": 0.0,
                 "gpu_active_ratio": 0.0,
@@ -293,6 +309,7 @@ def create_profiling_wrapper(
                 "total_vram_mb": 0.0,
                 "loop_detection_method": "none",
                 "loop_detection_confidence": None,
+                "flop_utilization": None,
             }}
 
             has_cuda = torch.cuda.is_available() if "torch" in sys.modules else False
@@ -350,6 +367,7 @@ def create_profiling_wrapper(
             try:
                 if profiler_ctx is not None:
                     profiler_ctx.__enter__()
+                    _profiler_ctx_ref[0] = profiler_ctx
 
                 # Import and run the entry point
                 spec = importlib.util.spec_from_file_location("__train_module__", entry_path)
@@ -408,6 +426,20 @@ def create_profiling_wrapper(
                         cuda_us = _event_cuda_time_us(ev)
                         cpu_us = _event_cpu_time_us(ev)
                         if cuda_us > 0:
+                            raw_shapes = getattr(ev, "input_shapes", None) or []
+                            # input_shapes can be a list of lists; serialise to plain lists
+                            try:
+                                shapes = [list(s) for s in raw_shapes] if raw_shapes else []
+                            except Exception:
+                                shapes = []
+                            # Try to get stack info if available
+                            stack_lines = []
+                            if hasattr(ev, 'stack') and ev.stack:
+                                for frame in ev.stack:
+                                    frame_str = str(frame)
+                                    # Filter to user code (exclude torch internals)
+                                    if 'site-packages' not in frame_str and 'torch/' not in frame_str:
+                                        stack_lines.append(frame_str)
                             ops.append({{
                                 "name": ev.key,
                                 "gpu_time_ms": cuda_us / 1000.0,
@@ -415,8 +447,53 @@ def create_profiling_wrapper(
                                 "pct_total": (cuda_us / total_cuda * 100) if total_cuda > 0 else 0,
                                 "call_count": ev.count,
                                 "flops": getattr(ev, "flops", None) or 0,
+                                "input_shapes": shapes,
+                                "source_stack": stack_lines[:3],
                             }})
                     profile_data["top_operators"] = ops
+
+                    # ---- Real forward/backward split ----
+                    fwd_cuda_us = 0.0
+                    bwd_cuda_us = 0.0
+                    for ev in averages:
+                        key_lower = ev.key.lower()
+                        is_backward = (
+                            "backward" in key_lower
+                            or "autograd" in key_lower
+                            or "AccumulateGrad" in ev.key
+                        )
+                        cuda_us = _event_cuda_time_us(ev)
+                        if is_backward:
+                            bwd_cuda_us += cuda_us
+                        else:
+                            fwd_cuda_us += cuda_us
+                    if fwd_cuda_us > 0 or bwd_cuda_us > 0:
+                        profile_data["forward_time_ms"] = fwd_cuda_us / 1000.0
+                        profile_data["backward_time_ms"] = bwd_cuda_us / 1000.0
+                        profile_data["fwd_bwd_split_method"] = "measured"
+
+                    # ---- FLOP utilization ----
+                    total_flops = sum(op.get("flops", 0) for op in ops if op.get("flops"))
+                    total_gpu_time_s = sum(op["gpu_time_ms"] for op in ops) / 1000.0
+                    _GPU_PEAK_TFLOPS = {{
+                        "H100": 989e12,
+                        "A100": 312e12,
+                        "A10G": 125e12,
+                        "T4": 65e12,
+                    }}
+                    if total_flops > 0 and total_gpu_time_s > 0:
+                        try:
+                            gpu_name = torch.cuda.get_device_properties(0).name
+                            peak_tflops = None
+                            for model_key, peak in _GPU_PEAK_TFLOPS.items():
+                                if model_key in gpu_name:
+                                    peak_tflops = peak
+                                    break
+                            if peak_tflops is not None:
+                                flop_utilization = (total_flops / total_gpu_time_s) / peak_tflops
+                                profile_data["flop_utilization"] = flop_utilization
+                        except Exception:
+                            pass
 
                     # GPU utilization estimate
                     step_times = _step_counter["step_times"]
@@ -435,50 +512,50 @@ def create_profiling_wrapper(
 
             # ---- Extract memory data ----
             if has_cuda:
+                # Stop recording first (safe even if it wasn't started)
                 try:
-                    snapshot = torch.cuda.memory._snapshot()
                     torch.cuda.memory._record_memory_history(enabled=None)
+                except Exception:
+                    pass
 
+                # Peak memory -- simple and reliable
+                try:
                     peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
                     profile_data["peak_memory_mb"] = peak_mb
 
-                    # Total VRAM and memory utilization ratio
-                    # Evidence source: torch.cuda.get_device_properties().total_memory
-                    try:
-                        device_props = torch.cuda.get_device_properties(
-                            torch.cuda.current_device()
-                        )
-                        total_vram_mb = device_props.total_memory / (1024 * 1024)
-                        profile_data["total_vram_mb"] = total_vram_mb
-                        if total_vram_mb > 0:
-                            profile_data["memory_utilization_ratio"] = peak_mb / total_vram_mb
-                    except Exception:
-                        pass
+                    device_props = torch.cuda.get_device_properties(
+                        torch.cuda.current_device()
+                    )
+                    total_vram_mb = device_props.total_memory / (1024 * 1024)
+                    profile_data["total_vram_mb"] = total_vram_mb
+                    if total_vram_mb > 0:
+                        profile_data["memory_utilization_ratio"] = peak_mb / total_vram_mb
 
-                    # Memory timeline from snapshot
-                    if snapshot and "segments" in snapshot:
-                        # Simplified: just record current state
-                        allocated = torch.cuda.memory_allocated() / (1024 * 1024)
-                        reserved = torch.cuda.memory_reserved() / (1024 * 1024)
-                        profile_data["memory_timeline"] = [
-                            {{"step": 0, "allocated_mb": allocated, "reserved_mb": reserved}}
-                        ]
+                    allocated = torch.cuda.memory_allocated() / (1024 * 1024)
+                    reserved = torch.cuda.memory_reserved() / (1024 * 1024)
+                    profile_data["memory_timeline"] = [
+                        {{"step": 0, "allocated_mb": allocated, "reserved_mb": reserved}}
+                    ]
 
-                    # Save raw snapshot
                     with open(ARTIFACT_DIR / "memory_snapshot.json", "w") as f:
-                        json.dump({{"peak_memory_mb": peak_mb}}, f)
+                        json.dump({{"peak_memory_mb": peak_mb, "total_vram_mb": total_vram_mb}}, f)
 
                 except Exception as e:
-                    print(f"[gpunity] Memory extraction error: {{e}}")
+                    print(f"[gpunity] Peak memory extraction error: {{e}}")
 
-            # ---- Estimate forward/backward split ----
-            # Use step times as a rough proxy
+            # ---- Forward/backward split (fallback when profiler data unavailable) ----
+            # Real measurement is done in the torch.profiler extraction block above.
+            # Only apply the heuristic here if we didn't get measured values.
             step_times = _step_counter["step_times"]
-            if step_times:
+            if (
+                profile_data.get("fwd_bwd_split_method") != "measured"
+                and step_times
+            ):
                 avg_step = sum(step_times) / len(step_times) * 1000  # ms
                 # Rough heuristic: forward ~30%, backward ~70% for typical training
                 profile_data["forward_time_ms"] = avg_step * 0.3
                 profile_data["backward_time_ms"] = avg_step * 0.7
+                profile_data["fwd_bwd_split_method"] = "estimated"
 
             # ---- DataLoader stats ----
             stall_times = _dl_stats["stall_times"]
@@ -496,6 +573,8 @@ def create_profiling_wrapper(
                 profile_data["dataloader_throughput"] = throughput
                 profile_data["dataloader_stall_time_ms"] = avg_stall
                 profile_data["dataloader_bottleneck"] = is_bottleneck
+                profile_data["dataloader_num_workers"] = _dl_stats.get("num_workers", 0)
+                profile_data["dataloader_pin_memory"] = _dl_stats.get("pin_memory", False)
 
             # ---- H2D transfer time ----
             # Evidence source: monkey-patched Tensor.to() / Tensor.cuda()

@@ -238,6 +238,148 @@ def apply_config_cmd(config_json: str, repo_path: str) -> None:
         click.echo(f"  wrote: {path}")
 
 
+@main.command("deploy")
+@click.argument("config_json", type=click.Path(exists=True))
+@click.option("--repo", "repo_path", required=True, type=click.Path(exists=True),
+              help="Path to the ML training repository.")
+@click.option("--gpu", "gpu_type", default="a100-80gb",
+              type=click.Choice(["a100-80gb", "a100-40gb", "h100", "a10g"]),
+              help="GPU type for Modal sandbox.")
+@click.option("--entry", "entry_point", default="train.py",
+              help="Training script entry point.")
+@click.option("--steps", "train_steps", default=None, type=int,
+              help="Number of training steps (passed as TRAIN_STEPS env var).")
+@click.option("--local", is_flag=True, help="Run locally instead of on Modal.")
+@click.option("--python-bin", default=None, type=click.Path(exists=True),
+              help="Python binary for local execution.")
+@click.option("--timeout", "timeout_seconds", default=3600, type=int,
+              help="Maximum execution time in seconds.")
+def deploy(
+    config_json: str,
+    repo_path: str,
+    gpu_type: str,
+    entry_point: str,
+    train_steps: Optional[int],
+    local: bool,
+    python_bin: Optional[str],
+    timeout_seconds: int,
+) -> None:
+    """Deploy a winning optimization config for full training on Modal.
+
+    Applies the optimization config to the repo and runs full training
+    in a GPU sandbox. This is for production training runs, not profiling.
+
+    CONFIG_JSON is the path to a saved optimization config JSON file.
+    """
+    from gpunity.types import OptimizationConfig
+    from gpunity.validator.patcher import apply_config
+
+    config_path = Path(config_json)
+    with open(config_path) as f:
+        opt_config = OptimizationConfig.from_dict(json.load(f))
+
+    click.echo(f"GPUnity Deploy -- {opt_config.name}")
+    click.echo(f"  Config: {opt_config.id}")
+    click.echo(f"  GPU: {gpu_type}")
+    click.echo(f"  Repo: {repo_path}")
+    click.echo()
+
+    # Apply config to a temp copy
+    patched_repo = apply_config(Path(repo_path), opt_config)
+    click.echo(f"Applied config to: {patched_repo}")
+
+    # Generate a simple training wrapper (not the profiling wrapper)
+    train_steps_env = f'os.environ["TRAIN_STEPS"] = "{train_steps}"' if train_steps else ""
+    wrapper_script = f'''#!/usr/bin/env python3
+"""GPUnity deploy wrapper -- runs optimized training."""
+
+import importlib.util
+import os
+import sys
+import time
+
+repo_dir = os.environ.get("REPO_DIR", os.getcwd())
+sys.path.insert(0, repo_dir)
+os.chdir(repo_dir)
+
+{train_steps_env}
+
+print("[gpunity deploy] Starting optimized training...")
+print(f"[gpunity deploy] Entry point: {entry_point}")
+start = time.time()
+
+# Load and run the entry point
+spec = importlib.util.spec_from_file_location(
+    "__train_module__",
+    os.path.join(repo_dir, "{entry_point}"),
+)
+if spec is None or spec.loader is None:
+    print(f"[gpunity deploy] ERROR: Cannot load {entry_point}")
+    sys.exit(1)
+
+module = importlib.util.module_from_spec(spec)
+sys.modules["__train_module__"] = module
+
+try:
+    spec.loader.exec_module(module)
+    # Try common entry functions if nothing ran
+    for candidate in ("train", "main", "run"):
+        fn = getattr(module, candidate, None)
+        if callable(fn):
+            fn()
+            break
+except Exception as e:
+    print(f"[gpunity deploy] ERROR: {{e}}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+
+elapsed = time.time() - start
+print(f"[gpunity deploy] Training complete in {{elapsed:.1f}}s")
+'''
+
+    click.echo("Launching training...")
+    artifact_dir = asyncio.run(
+        _run_deploy(
+            patched_repo=patched_repo,
+            wrapper_script=wrapper_script,
+            gpu_type=gpu_type,
+            local=local,
+            python_bin=python_bin,
+            timeout_seconds=timeout_seconds,
+        )
+    )
+    click.echo(f"\nDeploy complete. Artifacts in: {artifact_dir}")
+
+
+async def _run_deploy(
+    patched_repo: Path,
+    wrapper_script: str,
+    gpu_type: str,
+    local: bool,
+    python_bin: Optional[str],
+    timeout_seconds: int,
+) -> Path:
+    """Execute the deploy run in sandbox."""
+    if local:
+        from gpunity.sandbox.local_runner import run_locally
+        return await run_locally(
+            repo_path=patched_repo,
+            script_content=wrapper_script,
+            timeout_seconds=timeout_seconds,
+            python_bin=python_bin,
+        )
+    else:
+        from gpunity.sandbox.modal_runner import run_in_modal
+        return await run_in_modal(
+            repo_path=patched_repo,
+            script_content=wrapper_script,
+            gpu_type=gpu_type,
+            timeout_seconds=timeout_seconds,
+            stream_logs=True,
+        )
+
+
 async def run_pipeline(config: RunConfig) -> Path:
     """Execute the full GPUnity pipeline.
 

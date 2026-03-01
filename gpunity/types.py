@@ -48,6 +48,8 @@ class OperatorProfile:
     pct_total: float
     call_count: int
     flops: Optional[int] = None
+    input_shapes: list = field(default_factory=list)
+    source_stack: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -92,6 +94,8 @@ class ProfileResult:
     dataloader_throughput: float = 0.0
     dataloader_stall_time_ms: float = 0.0
     dataloader_bottleneck: bool = False
+    dataloader_num_workers: int = 0
+    dataloader_pin_memory: bool = False
 
     # Bottleneck diagnosis inputs
     h2d_transfer_time_ms: float = 0.0
@@ -108,6 +112,12 @@ class ProfileResult:
     # Artifact paths
     artifact_dir: Optional[str] = None
 
+    # Forward/backward measurement method
+    fwd_bwd_split_method: str = "estimated"
+
+    # FLOP utilization vs GPU peak (bf16)
+    flop_utilization: Optional[float] = None
+
     def summary(self) -> str:
         """Human-readable summary for the LLM agent to reason over."""
         lines = ["=== GPUnity Profile Summary ===", ""]
@@ -121,10 +131,20 @@ class ProfileResult:
         if self.top_operators:
             lines.append("Top GPU Operators:")
             for i, op in enumerate(self.top_operators[:10], 1):
-                lines.append(
+                op_line = (
                     f"  {i}. {op.name}: {op.gpu_time_ms:.2f}ms "
                     f"({op.pct_total:.1f}% of total, {op.call_count} calls)"
                 )
+                if op.input_shapes:
+                    op_line += f"  shapes={op.input_shapes}"
+                lines.append(op_line)
+                if op.source_stack:
+                    lines.append(f"      Source: {op.source_stack[0]}")
+            lines.append("")
+
+        # FLOP utilization
+        if self.flop_utilization is not None:
+            lines.append(f"FLOP utilization: {self.flop_utilization:.1%} of GPU peak")
             lines.append("")
 
         # Forward/backward split
@@ -132,8 +152,9 @@ class ProfileResult:
             total = self.forward_time_ms + self.backward_time_ms
             fwd_pct = (self.forward_time_ms / total * 100) if total > 0 else 0
             bwd_pct = (self.backward_time_ms / total * 100) if total > 0 else 0
-            lines.append(f"Forward time: {self.forward_time_ms:.2f}ms ({fwd_pct:.1f}%)")
-            lines.append(f"Backward time: {self.backward_time_ms:.2f}ms ({bwd_pct:.1f}%)")
+            split_tag = f" ({self.fwd_bwd_split_method})"
+            lines.append(f"Forward time: {self.forward_time_ms:.2f}ms ({fwd_pct:.1f}%){split_tag}")
+            lines.append(f"Backward time: {self.backward_time_ms:.2f}ms ({bwd_pct:.1f}%){split_tag}")
             if self.backward_time_ms > 0 and self.forward_time_ms > 0:
                 ratio = self.backward_time_ms / self.forward_time_ms
                 lines.append(f"Backward/Forward ratio: {ratio:.1f}x")
@@ -143,6 +164,7 @@ class ProfileResult:
         lines.append(f"DataLoader throughput: {self.dataloader_throughput:.1f} samples/sec")
         lines.append(f"DataLoader stall time: {self.dataloader_stall_time_ms:.2f} ms/step")
         lines.append(f"DataLoader bottleneck: {'YES' if self.dataloader_bottleneck else 'No'}")
+        lines.append(f"DataLoader config: num_workers={self.dataloader_num_workers}, pin_memory={self.dataloader_pin_memory}")
         lines.append("")
 
         # Memory timeline
@@ -195,7 +217,16 @@ class ProfileResult:
     def from_dict(cls, d: dict[str, Any]) -> ProfileResult:
         """Deserialize from dict."""
         d = d.copy()
-        d["top_operators"] = [OperatorProfile(**op) for op in d.get("top_operators", [])]
+        # Deserialise top_operators, handling new input_shapes/source_stack fields gracefully
+        raw_ops = d.get("top_operators", [])
+        top_ops = []
+        valid_op_fields = {f.name for f in OperatorProfile.__dataclass_fields__.values()}
+        for op in raw_ops:
+            op_data = {k: v for k, v in op.items() if k in valid_op_fields}
+            op_data.setdefault("input_shapes", [])
+            op_data.setdefault("source_stack", [])
+            top_ops.append(OperatorProfile(**op_data))
+        d["top_operators"] = top_ops
         d["memory_timeline"] = [
             MemoryTimelineEntry(**e) for e in d.get("memory_timeline", [])
         ]
@@ -203,9 +234,22 @@ class ProfileResult:
         d["loop_detection_method"] = LoopDetectionMethod(
             d.get("loop_detection_method", "none")
         )
+        # Handle new fields not present in old serialised data
+        d.setdefault("fwd_bwd_split_method", "estimated")
+        d.setdefault("flop_utilization", None)
+        d.setdefault("dataloader_num_workers", 0)
+        d.setdefault("dataloader_pin_memory", False)
         valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
         d = {k: v for k, v in d.items() if k in valid_fields}
         return cls(**d)
+
+
+@dataclass
+class CodeReference:
+    """Source code location referenced by an optimization proposal."""
+    file: str
+    line: int
+    snippet: str = ""
 
 
 @dataclass
@@ -227,12 +271,14 @@ class OptimizationConfig:
     eligible: bool = True
     ineligible_reason: Optional[str] = None
     heuristic_rationale: list[str] = field(default_factory=list)
+    code_refs: list[CodeReference] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict for JSON storage."""
         d = asdict(self)
         d["optimization_type"] = self.optimization_type.value
         d["risk_level"] = self.risk_level.value
+        d["code_refs"] = [{"file": cr.file, "line": cr.line, "snippet": cr.snippet} for cr in self.code_refs]
         return d
 
     @classmethod
@@ -241,6 +287,7 @@ class OptimizationConfig:
         d = d.copy()
         d["optimization_type"] = OptimizationType(d["optimization_type"])
         d["risk_level"] = RiskLevel(d["risk_level"])
+        d["code_refs"] = [CodeReference(**cr) for cr in d.get("code_refs", [])]
         return cls(**d)
 
 

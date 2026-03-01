@@ -5,6 +5,8 @@ Used for local/demo runs when API-backed LLM providers are unavailable.
 
 from __future__ import annotations
 
+import ast
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -19,6 +21,103 @@ from gpunity.types import (
 
 if TYPE_CHECKING:
     from gpunity.diagnosis.bottleneck import BottleneckDiagnosis
+
+
+def _generate_dataloader_code_patch(repo_path: Path, entry_point: str, overrides: dict) -> dict[str, str]:
+    """Generate code patches for DataLoader constructor calls using AST.
+
+    Finds DataLoader(...) calls in the entry point and rewrites keyword args
+    to match the optimization overrides.
+
+    Returns:
+        dict mapping file path -> new file content (empty if AST rewrite fails).
+    """
+    entry_path = repo_path / entry_point
+    if not entry_path.exists():
+        return {}
+
+    try:
+        source = entry_path.read_text()
+        tree = ast.parse(source)
+    except (OSError, SyntaxError):
+        return {}
+
+    # Map config override keys to DataLoader keyword arg names
+    _OVERRIDE_TO_KWARG = {
+        "dataloader_num_workers": "num_workers",
+        "dataloader_pin_memory": "pin_memory",
+        "dataloader_prefetch_factor": "prefetch_factor",
+        "dataloader_persistent_workers": "persistent_workers",
+    }
+
+    # Build the kwargs we want to set
+    target_kwargs = {}
+    for override_key, kwarg_name in _OVERRIDE_TO_KWARG.items():
+        if override_key in overrides:
+            target_kwargs[kwarg_name] = overrides[override_key]
+
+    if not target_kwargs:
+        return {}
+
+    # Find DataLoader(...) call sites
+    lines = source.splitlines(keepends=True)
+    modified = False
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        # Check if this is a DataLoader call
+        func = node.func
+        is_dataloader = False
+        if isinstance(func, ast.Name) and func.id == "DataLoader":
+            is_dataloader = True
+        elif isinstance(func, ast.Attribute) and func.attr == "DataLoader":
+            is_dataloader = True
+
+        if not is_dataloader:
+            continue
+
+        # Found a DataLoader call - update or add keyword arguments
+        existing_kwargs = {kw.arg: kw for kw in node.keywords if kw.arg is not None}
+
+        for kwarg_name, value in target_kwargs.items():
+            if kwarg_name in existing_kwargs:
+                # Replace existing value
+                kw_node = existing_kwargs[kwarg_name]
+                old_line_idx = kw_node.lineno - 1
+                if isinstance(value, bool):
+                    new_val_str = "True" if value else "False"
+                elif isinstance(value, int):
+                    new_val_str = str(value)
+                else:
+                    new_val_str = repr(value)
+                # Use regex to replace just the value for this kwarg on its line
+                pattern = rf'({re.escape(kwarg_name)}\s*=\s*)[^,\)]+'
+                lines[old_line_idx] = re.sub(pattern, rf'\g<1>{new_val_str}', lines[old_line_idx])
+                modified = True
+            else:
+                # Add new kwarg before the closing paren
+                # Find the line with the closing paren of the DataLoader call
+                end_line_idx = node.end_lineno - 1 if node.end_lineno else node.lineno - 1
+                if isinstance(value, bool):
+                    new_val_str = "True" if value else "False"
+                elif isinstance(value, int):
+                    new_val_str = str(value)
+                else:
+                    new_val_str = repr(value)
+                # Insert before closing paren
+                close_line = lines[end_line_idx]
+                paren_pos = close_line.rfind(")")
+                if paren_pos >= 0:
+                    indent = "    "  # Default indent for kwargs
+                    new_kwarg = f"{indent}{kwarg_name}={new_val_str},\n"
+                    # Insert the new kwarg line before the closing paren line
+                    lines.insert(end_line_idx, new_kwarg)
+                    modified = True
+
+    if modified:
+        return {entry_point: "".join(lines)}
+    return {}
 
 
 _ATTN_KEYWORDS = (
@@ -86,6 +185,22 @@ def _has_optimizer_signal(profile: ProfileResult) -> tuple[bool, list[str]]:
     return False, []
 
 
+def _is_1x1_conv(op) -> bool:
+    """Return True if the operator's weight shape indicates a 1x1 convolution.
+
+    For aten::conv2d the input_shapes list typically looks like:
+        [[N, C_in, H, W], [C_out, C_in, kH, kW], ...]
+    A 1x1 conv has kH == kW == 1 (indices 2 and 3 of the weight shape).
+    """
+    shapes = getattr(op, "input_shapes", None) or []
+    if len(shapes) >= 2:
+        weight_shape = shapes[1]
+        if len(weight_shape) == 4:
+            kH, kW = weight_shape[2], weight_shape[3]
+            return kH == 1 and kW == 1
+    return False
+
+
 def _has_conv_signal(profile: ProfileResult) -> tuple[bool, bool, float, list[str]]:
     """Detect convolution-heavy workloads.
 
@@ -95,17 +210,30 @@ def _has_conv_signal(profile: ProfileResult) -> tuple[bool, bool, float, list[st
     conv_pct = 0.0
     is_3d = False
     evidence = []
+    all_1x1 = True  # tracks whether ALL detected conv ops are 1x1
+    found_any = False
     for op in profile.top_operators:
         name = op.name.lower()
         if any(k in name for k in _CONV_KEYWORDS):
+            found_any = True
             conv_pct += op.pct_total
-            evidence.append(
-                f"Operator `{op.name}` accounts for {op.pct_total:.1f}% of GPU time"
-            )
+            op_note = f"Operator `{op.name}` accounts for {op.pct_total:.1f}% of GPU time"
+            if _is_1x1_conv(op):
+                op_note += " (1x1 kernel — channels_last won't help)"
+            else:
+                all_1x1 = False
+            evidence.append(op_note)
             if any(k in name for k in _CONV3D_KEYWORDS):
                 is_3d = True
     if conv_pct > 0:
         evidence.insert(0, f"Conv ops total {conv_pct:.1f}% of GPU time")
+        # If every detected conv is 1x1, suppress the channels_last recommendation
+        if found_any and all_1x1:
+            evidence.append(
+                "All detected conv ops are 1x1 kernels — channels_last memory format "
+                "provides no layout benefit for 1x1 convolutions"
+            )
+            return False, is_3d, conv_pct, evidence
         return True, is_3d, conv_pct, evidence
     return False, False, 0.0, []
 
@@ -113,6 +241,8 @@ def _has_conv_signal(profile: ProfileResult) -> tuple[bool, bool, float, list[st
 def _add_bottleneck_configs(
     diagnosis: BottleneckDiagnosis,
     profile: ProfileResult,
+    repo_path: Path,
+    entry_point: str,
     configs: list[OptimizationConfig],
     add,
     max_configs: int,
@@ -138,6 +268,10 @@ def _add_bottleneck_configs(
             ),
             optimization_type=OptimizationType.DATA_LOADING,
             evidence=evidence,
+            code_changes=_generate_dataloader_code_patch(repo_path, entry_point, {
+                "dataloader_num_workers": 8,
+                "dataloader_pin_memory": True,
+            }),
             config_overrides={
                 "dataloader_num_workers": 8,
                 "dataloader_pin_memory": True,
@@ -160,6 +294,12 @@ def _add_bottleneck_configs(
             ),
             optimization_type=OptimizationType.DATA_LOADING,
             evidence=evidence,
+            code_changes=_generate_dataloader_code_patch(repo_path, entry_point, {
+                "dataloader_num_workers": 8,
+                "dataloader_pin_memory": True,
+                "dataloader_prefetch_factor": 4,
+                "dataloader_persistent_workers": True,
+            }),
             config_overrides={
                 "dataloader_num_workers": 8,
                 "dataloader_pin_memory": True,
@@ -338,9 +478,17 @@ def generate_heuristic_configs(
         if len(configs) < max_configs:
             configs.append(config)
 
+    # Detect entry point from repo
+    entry_candidates = ["train.py", "main.py", "run.py"]
+    entry_point = "train.py"
+    for candidate in entry_candidates:
+        if (repo_path / candidate).exists():
+            entry_point = candidate
+            break
+
     # Bottleneck-driven configs (highest priority — added first)
     if diagnosis is not None:
-        _add_bottleneck_configs(diagnosis, profile, configs, add, max_configs)
+        _add_bottleneck_configs(diagnosis, profile, repo_path, entry_point, configs, add, max_configs)
 
     has_attention, attn_evidence = _has_attention_signal(profile)
     has_optimizer, optimizer_evidence = _has_optimizer_signal(profile)
@@ -421,6 +569,10 @@ def generate_heuristic_configs(
                 f"DataLoader stall time is {profile.dataloader_stall_time_ms:.2f} ms/step",
                 "Profile marked DataLoader as a bottleneck",
             ],
+            code_changes=_generate_dataloader_code_patch(repo_path, entry_point, {
+                "dataloader_num_workers": 4,
+                "dataloader_pin_memory": True,
+            }),
             config_overrides={
                 "dataloader_num_workers": 4,
                 "dataloader_pin_memory": True,
@@ -450,7 +602,25 @@ def generate_heuristic_configs(
             risk_level=RiskLevel.MEDIUM,
         ))
 
+    flop_util = getattr(profile, "flop_utilization", None)
+    _compile_flop_signal = (
+        flop_util is not None
+        and flop_util < 0.3
+        and profile.gpu_utilization > 50
+    )
     if profile.gpu_utilization > 0 and profile.gpu_utilization < 70:
+        compile_evidence = [
+            f"GPU utilization is {profile.gpu_utilization:.1f}%",
+            "Lower utilization often indicates kernel launch/graph overhead",
+        ]
+        compile_speedup = 1.20
+        if _compile_flop_signal:
+            compile_evidence.append(
+                f"FLOP utilization = {flop_util:.1%} of GPU peak — low FLOPs "
+                "despite active GPU strongly suggests kernel launch overhead; "
+                "torch.compile can fuse small kernels into fewer, larger ones"
+            )
+            compile_speedup = 1.35  # boosted estimate for launch-overhead workloads
         add(OptimizationConfig(
             id=f"opt-{len(configs) + 1:03d}",
             name="Enable torch.compile",
@@ -459,12 +629,31 @@ def generate_heuristic_configs(
                 "reduce launch overhead."
             ),
             optimization_type=OptimizationType.COMPILATION,
+            evidence=compile_evidence,
+            config_overrides={"compile": True, "compile_mode": "reduce-overhead"},
+            estimated_speedup=compile_speedup,
+            estimated_memory_delta=-0.05,
+            risk_level=RiskLevel.LOW,
+        ))
+    elif _compile_flop_signal:
+        # GPU utilization >= 70 but FLOP utilization is low — still worth trying compile
+        add(OptimizationConfig(
+            id=f"opt-{len(configs) + 1:03d}",
+            name="Enable torch.compile (kernel launch overhead signal)",
+            description=(
+                "FLOP utilization is low despite high GPU activity, indicating many "
+                "small, memory-bound kernels with significant launch overhead. "
+                "torch.compile fuses these kernels, reducing launch overhead and "
+                "improving FLOP utilization."
+            ),
+            optimization_type=OptimizationType.COMPILATION,
             evidence=[
-                f"GPU utilization is {profile.gpu_utilization:.1f}%",
-                "Lower utilization often indicates kernel launch/graph overhead",
+                f"FLOP utilization = {flop_util:.1%} of GPU peak",
+                f"GPU utilization = {profile.gpu_utilization:.1f}% (active but compute-inefficient)",
+                "Low FLOP utilization with high GPU activity → kernel launch overhead",
             ],
             config_overrides={"compile": True, "compile_mode": "reduce-overhead"},
-            estimated_speedup=1.20,
+            estimated_speedup=1.30,
             estimated_memory_delta=-0.05,
             risk_level=RiskLevel.LOW,
         ))

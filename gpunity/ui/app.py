@@ -59,7 +59,6 @@ def _export_configs(configs: list[OptimizationConfig], output_dir: Path) -> Path
 
 
 async def _execute_pipeline_phased(config: Any, status_container) -> DashboardResult:
-    """Execute pipeline with phased progress updates for the UI."""
     from gpunity.cli import run_profile_phase
     from gpunity.diagnosis.bottleneck import diagnose_bottleneck
     from gpunity.hardware.profile import detect_hardware_profile, resolve_workload_mode
@@ -69,7 +68,7 @@ async def _execute_pipeline_phased(config: Any, status_container) -> DashboardRe
     sandbox_mode = "Modal Sandbox" if not config.local else "Local Sandbox"
     provider_label = config.provider.capitalize()
 
-    status_container.write(f"Phase 1: Profiling training script in {sandbox_mode}...")
+    status_container.info(f"Phase 1: Profiling training script in {sandbox_mode}...")
     profile_result = await run_profile_phase(config)
     gpu_util = getattr(profile_result, "gpu_utilization", None)
     peak_mem = getattr(profile_result, "peak_memory_mb", None)
@@ -78,7 +77,7 @@ async def _execute_pipeline_phased(config: Any, status_container) -> DashboardRe
         phase1_msg += f" GPU util: {gpu_util:.0f}%"
     if peak_mem is not None:
         phase1_msg += f", Peak VRAM: {peak_mem:.0f} MB"
-    status_container.write(phase1_msg)
+    status_container.info(phase1_msg)
 
     hardware = detect_hardware_profile(config)
     mode = resolve_workload_mode(config.mode, profile_result)
@@ -87,13 +86,13 @@ async def _execute_pipeline_phased(config: Any, status_container) -> DashboardRe
     if config.gpu_selection == "auto":
         diagnosis = diagnose_bottleneck(profile_result, hardware, config.gpu_aggressiveness)
         if diagnosis:
-            status_container.write(
+            status_container.info(
                 f"Bottleneck: {diagnosis.primary.value} (confidence: {diagnosis.confidence})"
             )
 
     from gpunity.agent.loop import run_agent_loop
 
-    status_container.write(f"Phase 2: {provider_label} LLM analyzing profile and proposing optimizations...")
+    status_container.info(f"Phase 2: {provider_label} LLM analyzing profile and proposing optimizations...")
     optimization_configs = await run_agent_loop(
         profile_result,
         Path(config.repo_path),
@@ -102,14 +101,14 @@ async def _execute_pipeline_phased(config: Any, status_container) -> DashboardRe
         mode=mode,
         diagnosis=diagnosis,
     )
-    status_container.write(f"Phase 2 complete. Generated {len(optimization_configs)} optimization configs.")
+    status_container.info(f"Phase 2 complete. Generated {len(optimization_configs)} optimization configs.")
 
     config_export_dir = _export_configs(
         optimization_configs,
         Path(config.output_path).parent / "gpunity_configs",
     )
 
-    status_container.write(
+    status_container.info(
         f"Phase 3: Validating {len(optimization_configs)} configs + control in parallel {sandbox_mode}s..."
     )
     control_run, validation_results, run_summary = await run_validation(
@@ -122,11 +121,11 @@ async def _execute_pipeline_phased(config: Any, status_container) -> DashboardRe
         diagnosis=diagnosis,
     )
     n_diverged = sum(1 for r in validation_results if r.diverged)
-    status_container.write(
+    status_container.info(
         f"Phase 3 complete. {len(validation_results)} validated, {n_diverged} diverged."
     )
 
-    status_container.write("Phase 4: Generating report...")
+    status_container.info("Phase 4: Generating report...")
     output_path = Path(config.output_path)
     report_path = generate_report(
         run_config=config,
@@ -437,6 +436,90 @@ def _render_result(result: DashboardResult, cost_cap_ratio: float) -> None:
         st.write(f"Report: {result.report_path}")
         st.write(f"Configs: {result.config_export_dir}")
 
+    # Deploy section
+    st.subheader("Deploy Winning Config")
+    best_config_id = result.run_summary.best_overall_config_id
+    if best_config_id:
+        config_json_path = result.config_export_dir / f"{best_config_id}.json"
+        if config_json_path.exists():
+            deploy_col1, deploy_col2 = st.columns([2, 1])
+            with deploy_col1:
+                deploy_steps = st.number_input(
+                    "Training steps",
+                    min_value=100,
+                    max_value=1_000_000,
+                    value=1000,
+                    step=100,
+                    help="Number of training steps for the full training run.",
+                )
+                deploy_gpu = st.selectbox(
+                    "Deploy GPU",
+                    ["a100-80gb", "a100-40gb", "h100", "a10g"],
+                    key="deploy_gpu",
+                )
+            with deploy_col2:
+                st.caption(f"Config: {best_config_id}")
+                st.caption(f"File: {config_json_path}")
+                deploy_clicked = st.button(
+                    "Deploy on Modal",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            if deploy_clicked:
+                deploy_status = st.empty()
+                deploy_log = st.empty()
+                deploy_status.info("Deploying winning config on Modal...")
+                try:
+                    with open(config_json_path) as f:
+                        opt_config = OptimizationConfig.from_dict(json.load(f))
+
+                    from gpunity.validator.patcher import apply_config
+
+                    # Get repo_path from session - it's in the sidebar config
+                    repo_path = Path(st.session_state.get("_last_repo_path", "."))
+                    patched_repo = apply_config(repo_path, opt_config)
+
+                    entry_point = st.session_state.get("_last_entry_point", "train.py")
+                    train_steps_env = f'os.environ["TRAIN_STEPS"] = "{deploy_steps}"'
+                    wrapper_script = f'''#!/usr/bin/env python3
+"""GPUnity deploy wrapper."""
+import importlib.util, os, sys, time
+repo_dir = os.environ.get("REPO_DIR", os.getcwd())
+sys.path.insert(0, repo_dir)
+os.chdir(repo_dir)
+{train_steps_env}
+print("[gpunity deploy] Starting optimized training...")
+start = time.time()
+spec = importlib.util.spec_from_file_location("__train_module__", os.path.join(repo_dir, "{entry_point}"))
+module = importlib.util.module_from_spec(spec)
+sys.modules["__train_module__"] = module
+spec.loader.exec_module(module)
+for candidate in ("train", "main", "run"):
+    fn = getattr(module, candidate, None)
+    if callable(fn):
+        fn()
+        break
+elapsed = time.time() - start
+print(f"[gpunity deploy] Training complete in {{elapsed:.1f}}s")
+'''
+                    from gpunity.sandbox.modal_runner import run_in_modal
+
+                    artifact_dir = _run_coro(run_in_modal(
+                        repo_path=patched_repo,
+                        script_content=wrapper_script,
+                        gpu_type=deploy_gpu,
+                        timeout_seconds=3600,
+                        stream_logs=True,
+                    ))
+                    deploy_status.success(f"Deploy complete! Artifacts: {artifact_dir}")
+                except Exception as exc:
+                    deploy_status.error(f"Deploy failed: {exc}")
+        else:
+            st.warning(f"Config file not found: {config_json_path}")
+    else:
+        st.info("No winning config to deploy. Run the optimization pipeline first.")
+
 
 def _render_sidebar() -> dict[str, Any]:
     st.sidebar.header("Run Controls")
@@ -446,16 +529,28 @@ def _render_sidebar() -> dict[str, Any]:
     entry_point = st.sidebar.text_input("Entry point", value="gpunity_entry_nanogpt.py")
     output_path = st.sidebar.text_input("Report path", value="./logs/streamlit_report.md")
     provider = st.sidebar.selectbox(
-        "Provider", ["openai", "heuristic", "modal", "claude", "custom"], index=0
+        "Provider", ["openai", "heuristic", "modal", "claude"], index=0
     )
 
+    model = None
     modal_vllm_url = ""
-    if provider == "modal":
+    if provider == "openai":
+        model = st.sidebar.selectbox(
+            "Model", ["gpt-5.2", "gpt-5.2-mini", "gpt-4o"], index=0
+        )
+    elif provider == "claude":
+        model = st.sidebar.selectbox(
+            "Model",
+            ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-5-20251001"],
+            index=0,
+        )
+    elif provider == "modal":
         modal_vllm_url = st.sidebar.text_input(
             "Modal vLLM URL",
             value=os.environ.get("MODAL_VLLM_URL", ""),
             help="Deploy modal_app.py and paste the endpoint URL here.",
         )
+        st.sidebar.text_input("Model", value="Qwen/Qwen3-8B", disabled=True)
     objective_profile = st.sidebar.selectbox(
         "Objective profile",
         ["latency", "balanced", "cost", "throughput"],
@@ -489,6 +584,7 @@ def _render_sidebar() -> dict[str, Any]:
         "entry_point": entry_point,
         "output_path": output_path,
         "provider": provider,
+        "model": model,
         "modal_vllm_url": modal_vllm_url,
         "objective_profile": objective_profile,
         "validation_strategy": validation_strategy,
@@ -629,6 +725,7 @@ def main() -> None:
             "output_path": sidebar["output_path"],
             "entry_point": sidebar["entry_point"],
             "provider": sidebar["provider"],
+            "model": sidebar["model"],
             "objective_profile": sidebar["objective_profile"],
             "validation_strategy": sidebar["validation_strategy"],
             "gpu_type": sidebar["gpu_type"],
@@ -648,11 +745,13 @@ def main() -> None:
 
         try:
             config = load_config(cli_args)
-            status_container = st.container()
-            status_container.info("Running GPUnity pipeline...")
-            result = _run_coro(_execute_pipeline_phased(config, status_container))
-            status_container.success("Pipeline complete!")
+            status_placeholder = st.empty()
+            status_placeholder.info("Running GPUnity pipeline...")
+            result = _run_coro(_execute_pipeline_phased(config, status_placeholder))
+            status_placeholder.success("Pipeline complete!")
             st.session_state.last_result = result
+            st.session_state._last_repo_path = sidebar["repo_path"]
+            st.session_state._last_entry_point = sidebar["entry_point"]
             st.session_state.last_error = None
         except Exception as exc:
             st.session_state.last_error = str(exc)

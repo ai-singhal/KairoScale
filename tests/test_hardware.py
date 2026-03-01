@@ -1,7 +1,7 @@
 """Tests for hardware profile detection helpers."""
 
-from gpunity.hardware.profile import detect_hardware_profile, resolve_workload_mode
-from gpunity.types import LoopDetectionMethod, ProfileResult, RunConfig
+from KairoScale.hardware.profile import detect_hardware_profile, resolve_workload_mode
+from KairoScale.types import LoopDetectionMethod, ProfileResult, RunConfig
 
 
 def test_detectHardwareProfileManualUsesGpuType():

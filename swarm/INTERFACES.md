@@ -1,12 +1,12 @@
-# GPUnity Interface Contracts (MVP)
+# KairoScale Interface Contracts (MVP)
 
 This is the single source of truth for all module boundaries, function signatures, data schemas, and inter-module handoffs.
 
 ---
 
-## 1. Core Types (`gpunity/types.py`)
+## 1. Core Types (`KairoScale/types.py`)
 
-All modules import from `gpunity.types`. No module defines its own data transfer objects.
+All modules import from `KairoScale.types`. No module defines its own data transfer objects.
 
 ```python
 from __future__ import annotations
@@ -156,7 +156,7 @@ class RunConfig:
     divergence_threshold: float = 0.8
     gradient_check_interval: int = 5
     max_cost_per_sandbox: float = 5.0
-    output_path: Path = Path("./gpunity_report.md")
+    output_path: Path = Path("./KairoScale_report.md")
     charts_mode: str = "ascii"
     verbose: bool = False
     dry_run: bool = False
@@ -167,7 +167,7 @@ class RunConfig:
 
 ## 2. Module Interfaces
 
-### 2.1 CLI (`gpunity/cli.py`)
+### 2.1 CLI (`KairoScale/cli.py`)
 
 ```python
 # Entry point: Click CLI
@@ -178,7 +178,7 @@ def run_pipeline(config: RunConfig) -> Path:
     ...
 ```
 
-### 2.2 Config (`gpunity/config.py`)
+### 2.2 Config (`KairoScale/config.py`)
 
 ```python
 def load_config(cli_args: dict, yaml_path: Optional[Path] = None) -> RunConfig:
@@ -186,7 +186,7 @@ def load_config(cli_args: dict, yaml_path: Optional[Path] = None) -> RunConfig:
     ...
 ```
 
-### 2.3 Profiler (`gpunity/profiler/`)
+### 2.3 Profiler (`KairoScale/profiler/`)
 
 ```python
 # profiler/wrapper.py
@@ -236,7 +236,7 @@ def aggregate_profile(artifact_dir: Path) -> ProfileResult:
     ...
 ```
 
-### 2.4 Sandbox (`gpunity/sandbox/`)
+### 2.4 Sandbox (`KairoScale/sandbox/`)
 
 ```python
 # sandbox/modal_runner.py
@@ -270,7 +270,7 @@ def upload_artifacts(local_dir: Path, sandbox_path: Path) -> None: ...
 def download_artifacts(sandbox_path: Path, local_dir: Path) -> None: ...
 ```
 
-### 2.5 Agent (`gpunity/agent/`)
+### 2.5 Agent (`KairoScale/agent/`)
 
 ```python
 # agent/loop.py
@@ -327,7 +327,7 @@ class OpenAIProvider:
     async def complete(self, messages, tools=None, temperature=0.3) -> dict: ...
 ```
 
-### 2.6 Validator (`gpunity/validator/`)
+### 2.6 Validator (`KairoScale/validator/`)
 
 ```python
 # validator/runner.py
@@ -379,7 +379,7 @@ def compute_validation_metrics(
     ...
 ```
 
-### 2.7 Reporter (`gpunity/reporter/`)
+### 2.7 Reporter (`KairoScale/reporter/`)
 
 ```python
 # reporter/markdown.py
@@ -423,7 +423,7 @@ def render_summary_table(
     ...
 ```
 
-### 2.8 Utils (`gpunity/utils/`)
+### 2.8 Utils (`KairoScale/utils/`)
 
 ```python
 # utils/logging.py
@@ -474,7 +474,7 @@ artifacts/
     opt-002/
       ...
   report/
-    gpunity_report.md
+    KairoScale_report.md
 ```
 
 ---

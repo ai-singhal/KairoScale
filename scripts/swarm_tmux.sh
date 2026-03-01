@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SESSION="gpunity-swarm"
+SESSION="KairoScale-swarm"
 ROOT="$(pwd)"
 
 # Adjust these to your Claude Code CLI invocation.

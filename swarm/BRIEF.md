@@ -1,6 +1,6 @@
-# GPUnity Swarm Brief
+# KairoScale Swarm Brief
 
-Goal: Implement GPUnity MVP pipeline: Profile → Analyze → Validate → Report.
+Goal: Implement KairoScale MVP pipeline: Profile → Analyze → Validate → Report.
 
 Non-goals (MVP): multi-GPU comm profiling, HTML report, exhaustive loop detection.
 

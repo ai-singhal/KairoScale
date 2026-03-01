@@ -1,7 +1,7 @@
 """Tests for native baseline ladder generation."""
 
-from gpunity.optimizer.baselines import build_native_baseline_candidates
-from gpunity.types import HardwareProfile, LoopDetectionMethod, ProfileResult, RunConfig
+from KairoScale.optimizer.baselines import build_native_baseline_candidates
+from KairoScale.types import HardwareProfile, LoopDetectionMethod, ProfileResult, RunConfig
 
 
 def test_buildNativeBaselinesRequiredTrain():

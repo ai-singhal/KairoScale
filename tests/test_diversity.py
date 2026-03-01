@@ -1,7 +1,7 @@
-"""Tests for gpunity.agent.diversity."""
+"""Tests for KairoScale.agent.diversity."""
 
-from gpunity.agent.diversity import select_diverse_configs
-from gpunity.types import OptimizationConfig, OptimizationType, RiskLevel
+from KairoScale.agent.diversity import select_diverse_configs
+from KairoScale.types import OptimizationConfig, OptimizationType, RiskLevel
 
 
 def _makeConfig(name, optType, speedup, risk=RiskLevel.LOW):

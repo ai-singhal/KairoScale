@@ -1,4 +1,4 @@
-"""Tests for gpunity.config."""
+"""Tests for KairoScale.config."""
 
 import tempfile
 from pathlib import Path
@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from gpunity.config import load_config, load_yaml_config
+from KairoScale.config import load_config, load_yaml_config
 
 
 def test_loadConfigFromCliArgs(tmp_path):

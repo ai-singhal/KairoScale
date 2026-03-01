@@ -1,9 +1,9 @@
-"""Tests for gpunity.utils modules."""
+"""Tests for KairoScale.utils modules."""
 
 from pathlib import Path
 
-from gpunity.utils.cost import GPU_COSTS_PER_HOUR, estimate_cost
-from gpunity.utils.repo import detect_dependencies, scan_repo
+from KairoScale.utils.cost import GPU_COSTS_PER_HOUR, estimate_cost
+from KairoScale.utils.repo import detect_dependencies, scan_repo
 
 
 class TestScanRepo:

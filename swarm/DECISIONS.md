@@ -1,4 +1,4 @@
-# GPUnity Decision Log
+# KairoScale Decision Log
 
 ## D-001: Training-Loop Annotation Fallback Semantics
 - **Date**: 2026-02-28

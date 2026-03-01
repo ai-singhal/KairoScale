@@ -2,8 +2,8 @@
 
 from pathlib import Path
 
-from gpunity.agent.heuristic import generate_heuristic_configs
-from gpunity.types import OperatorProfile, ProfileResult
+from KairoScale.agent.heuristic import generate_heuristic_configs
+from KairoScale.types import OperatorProfile, ProfileResult
 
 
 def test_generateHeuristicConfigsAttentionAndCompile(tmp_path):

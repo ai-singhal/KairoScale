@@ -1,9 +1,9 @@
-"""Tests for gpunity.reporter.markdown."""
+"""Tests for KairoScale.reporter.markdown."""
 
 from pathlib import Path
 
-from gpunity.reporter.markdown import generate_report
-from gpunity.types import (
+from KairoScale.reporter.markdown import generate_report
+from KairoScale.types import (
     ControlRun,
     OperatorProfile,
     OptimizationConfig,
@@ -62,7 +62,7 @@ def test_generateReportCreatesFile(tmp_path):
     path = generate_report(config, profile, opts, control, results, output)
     assert path.exists()
     content = path.read_text()
-    assert "# GPUnity Optimization Report" in content
+    assert "# KairoScale Optimization Report" in content
     assert "Flash Attention" in content
     assert "aten::mm" in content
 
@@ -87,3 +87,31 @@ def test_generateReportNoConfigs(tmp_path):
     output = tmp_path / "report.md"
     path = generate_report(config, profile, [], control, [], output)
     assert path.exists()
+
+
+def test_generateReportIncludesComboSection(tmp_path):
+    config, profile, opts, control, results = _makeMinimalInputs(tmp_path)
+    combo = OptimizationConfig(
+        id="combo-001",
+        name="Combo: Flash Attention + Compile",
+        description="Combo",
+        optimization_type=OptimizationType.ATTENTION,
+        evidence=["combo evidence"],
+        estimated_speedup=1.8,
+        risk_level=RiskLevel.MEDIUM,
+        heuristic_rationale=["Combo members: opt-001,opt-009"],
+    )
+    opts.append(combo)
+    results.append(
+        ValidationResult(
+            config_id="combo-001",
+            config_name=combo.name,
+            success=True,
+            speedup_vs_control=1.6,
+        )
+    )
+    output = tmp_path / "report_combo.md"
+    path = generate_report(config, profile, opts, control, results, output)
+    content = path.read_text()
+    assert "## Combo Results" in content
+    assert "combo-001" in content

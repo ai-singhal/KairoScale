@@ -3,7 +3,7 @@ import modal
 
 async def main():
     print("Checking app lookup...")
-    app = await modal.App.lookup.aio("gpunity-sandbox", create_if_missing=True)
+    app = await modal.App.lookup.aio("KairoScale-sandbox", create_if_missing=True)
     print("App lookup done.")
     print("Creating sandbox...")
     sb = await modal.Sandbox.create.aio(

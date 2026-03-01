@@ -2,7 +2,7 @@ import asyncio
 import modal
 
 async def main():
-    app = await modal.App.lookup.aio("gpunity-sandbox", create_if_missing=True)
+    app = await modal.App.lookup.aio("KairoScale-sandbox", create_if_missing=True)
     sb = await modal.Sandbox.create.aio("bash", "-lc", "sleep 10", app=app)
     try:
         items = []

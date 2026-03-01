@@ -1,7 +1,7 @@
 """Tests for objective scoring and run summary."""
 
-from gpunity.optimizer.objective import score_validation_results, summarize_run
-from gpunity.types import (
+from KairoScale.optimizer.objective import score_validation_results, summarize_run
+from KairoScale.types import (
     BaselineResult,
     OptimizationConfig,
     OptimizationType,

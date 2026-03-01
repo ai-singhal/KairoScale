@@ -1,4 +1,4 @@
-# GPUnity Swarm Status
+# KairoScale Swarm Status
 > Last updated: 2026-02-28
 
 ## Completed

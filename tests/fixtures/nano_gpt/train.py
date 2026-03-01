@@ -1,4 +1,4 @@
-"""Minimal nanoGPT training script for testing GPUnity.
+"""Minimal nanoGPT training script for testing KairoScale.
 
 This is a tiny transformer model with a synthetic dataset,
 designed to run in seconds on CPU for integration tests.

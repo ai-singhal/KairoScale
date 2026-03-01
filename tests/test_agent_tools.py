@@ -1,10 +1,10 @@
-"""Tests for gpunity.agent.tools."""
+"""Tests for KairoScale.agent.tools."""
 
 import json
 from pathlib import Path
 
-from gpunity.agent.tools import execute_tool, get_agent_tools
-from gpunity.types import ProfileResult
+from KairoScale.agent.tools import execute_tool, get_agent_tools
+from KairoScale.types import ProfileResult
 
 
 def _makeContext(tmp_path: Path) -> dict:

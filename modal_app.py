@@ -1,13 +1,13 @@
-"""GPUnity vLLM inference server on Modal.
+"""KairoScale vLLM inference server on Modal.
 
 Deploys a Qwen3-8B model with OpenAI-compatible API and tool-use support.
-Used by gpunity's Modal provider for the agent analysis loop.
+Used by KairoScale's Modal provider for the agent analysis loop.
 
 Deploy:
     modal deploy modal_app.py
 
 The endpoint URL will be printed after deployment. Set it in .env:
-    MODAL_VLLM_URL=https://<your-workspace>--gpunity-vllm-serve.modal.run
+    MODAL_VLLM_URL=https://<your-workspace>--KairoScale-vllm-serve.modal.run
 """
 
 from __future__ import annotations
@@ -17,10 +17,10 @@ import modal
 MODEL_NAME = "Qwen/Qwen3-8B"
 GPU_TYPE = "A10G"
 
-app = modal.App("gpunity-vllm")
+app = modal.App("KairoScale-vllm")
 
 # Persistent volume for model weights — avoids re-download on cold start
-model_volume = modal.Volume.from_name("gpunity-model-weights", create_if_missing=True)
+model_volume = modal.Volume.from_name("KairoScale-model-weights", create_if_missing=True)
 
 vllm_image = (
     modal.Image.debian_slim(python_version="3.11")

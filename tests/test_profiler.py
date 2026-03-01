@@ -1,8 +1,8 @@
-"""Tests for gpunity.profiler modules."""
+"""Tests for KairoScale.profiler modules."""
 
 from pathlib import Path
 
-from gpunity.profiler.wrapper import create_profiling_wrapper, detect_training_loop
+from KairoScale.profiler.wrapper import create_profiling_wrapper, detect_training_loop
 
 
 class TestDetectTrainingLoop:

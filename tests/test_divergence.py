@@ -1,8 +1,8 @@
-"""Tests for gpunity.validator.divergence."""
+"""Tests for KairoScale.validator.divergence."""
 
 import math
 
-from gpunity.validator.divergence import (
+from KairoScale.validator.divergence import (
     check_divergence,
     compare_logit_signatures,
     compute_cosine_similarities,

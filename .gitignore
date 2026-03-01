@@ -5,9 +5,10 @@ __pycache__/
 .pytest_cache/
 .env
 
-# Local GPUnity runtime artifacts
-gpunity_report.md
-gpunity_configs/
+# Local KairoScale runtime artifacts
+KairoScale_report.md
+KairoScale_configs/
+logs/
 logs/streamlit_report.md
 .streamlit/
 

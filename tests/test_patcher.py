@@ -1,7 +1,7 @@
 """Tests for validator patch application helpers."""
 
-from gpunity.types import OptimizationConfig, OptimizationType, RiskLevel
-from gpunity.validator.patcher import apply_config_in_place
+from KairoScale.types import OptimizationConfig, OptimizationType, RiskLevel
+from KairoScale.validator.patcher import apply_config_in_place
 
 
 def test_applyConfigInPlaceWritesFiles(tmp_path):
@@ -20,6 +20,6 @@ def test_applyConfigInPlaceWritesFiles(tmp_path):
 
     written = apply_config_in_place(tmp_path, config)
     assert (tmp_path / "train.py").read_text(encoding="utf-8") == "print('new')\n"
-    assert (tmp_path / ".gpunity_overrides.json").exists()
-    assert (tmp_path / ".gpunity_extra_requirements.txt").exists()
+    assert (tmp_path / ".KairoScale_overrides.json").exists()
+    assert (tmp_path / ".KairoScale_extra_requirements.txt").exists()
     assert len(written) >= 3

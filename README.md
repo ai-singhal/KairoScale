@@ -24,9 +24,10 @@ For LLM-backed analysis providers:
 ## Quick Setup (Recommended)
 
 ```bash
-python -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -U pip setuptools wheel
+python -m pip install -r requirements.txt
 ```
 
 `requirements.txt` installs this package with all integrations and dev tooling.
@@ -50,12 +51,20 @@ export MODAL_VLLM_URL=https://<workspace>--KairoScale-vllm-serve.modal.run
 
 `.env.example` includes Modal + OpenAI placeholders.
 
+Load env vars before running:
+
+```bash
+set -a
+source .env
+set +a
+```
+
 ## Run KairoScale
 
 ### Option A: Streamlit Command Center (fastest demo path)
 
 ```bash
-streamlit run KairoScale/ui/app.py
+python -m streamlit run KairoScale/ui/app.py
 ```
 
 Use this for live demos and hackathon judging flow.

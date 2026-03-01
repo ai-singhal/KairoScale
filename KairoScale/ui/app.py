@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import sys
+import zipfile
 from datetime import datetime
 from dataclasses import dataclass
 from itertools import combinations
@@ -96,6 +98,15 @@ def _render_logs_panel(enabled: bool) -> None:
         st.caption("No logs yet. Start a run to stream phase updates here.")
         return
     st.code("\n".join(logs), language="text")
+
+
+def _build_configs_zip(config_dir: Path) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        if config_dir.exists():
+            for cfg_path in sorted(config_dir.glob("*.json")):
+                archive.writestr(cfg_path.name, cfg_path.read_text(encoding="utf-8"))
+    return buffer.getvalue()
 
 
 async def _execute_pipeline_phased(
@@ -582,6 +593,47 @@ def _render_result(result: DashboardResult, cost_cap_ratio: float) -> None:
         st.write(f"Report: {result.report_path}")
         st.write(f"Configs: {result.config_export_dir}")
 
+        if result.report_path.exists():
+            st.download_button(
+                "Download report (.md)",
+                data=result.report_path.read_bytes(),
+                file_name=result.report_path.name,
+                mime="text/markdown",
+                key=f"download_report_{result.report_path.name}",
+                use_container_width=True,
+            )
+        else:
+            st.caption("Report file is not available yet.")
+
+        if result.config_export_dir.exists():
+            st.download_button(
+                "Download all configs (.zip)",
+                data=_build_configs_zip(result.config_export_dir),
+                file_name="KairoScale_configs.zip",
+                mime="application/zip",
+                key="download_configs_zip",
+                use_container_width=True,
+            )
+
+            winner_id = result.run_summary.best_overall_config_id
+            if winner_id:
+                winner_path = result.config_export_dir / f"{winner_id}.json"
+                if winner_path.exists():
+                    st.download_button(
+                        "Download winning config (.json)",
+                        data=winner_path.read_bytes(),
+                        file_name=winner_path.name,
+                        mime="application/json",
+                        key=f"download_winner_{winner_id}",
+                        use_container_width=True,
+                    )
+                    apply_repo = st.session_state.get("_last_repo_path", ".")
+                    st.caption("Apply winner in your repo")
+                    st.code(
+                        f"KairoScale apply {winner_path} --repo {apply_repo}",
+                        language="bash",
+                    )
+
     # Deploy section
     st.subheader("Deploy Winning Config")
     best_config_id = result.run_summary.best_overall_config_id
@@ -812,7 +864,6 @@ def _render_sidebar() -> dict[str, Any]:
     )
     gpu_type = st.sidebar.selectbox("GPU type", ["a100-80gb", "a100-40gb", "h100", "a10g"], index=0)
     local_mode = st.sidebar.checkbox("Local sandbox", value=False)
-    view_logs = st.sidebar.checkbox("View logs", value=True)
     profile_steps = st.sidebar.slider("Profile steps", min_value=5, max_value=200, value=80)
     validation_steps = st.sidebar.slider("Validation steps", min_value=10, max_value=400, value=150)
     top_k = st.sidebar.slider("Top-k validate", min_value=1, max_value=20, value=8)
@@ -839,7 +890,6 @@ def _render_sidebar() -> dict[str, Any]:
         "validation_strategy": validation_strategy,
         "gpu_type": gpu_type,
         "local": local_mode,
-        "view_logs": view_logs,
         "profile_steps": profile_steps,
         "validation_steps": validation_steps,
         "top_k": top_k,
@@ -965,6 +1015,8 @@ def main() -> None:
         st.session_state.last_error = None
     if "run_logs" not in st.session_state:
         st.session_state.run_logs = []
+    if "show_logs" not in st.session_state:
+        st.session_state.show_logs = True
 
     if sidebar["run_clicked"]:
         st.session_state.run_logs = []
@@ -1027,7 +1079,15 @@ def main() -> None:
     if st.session_state.last_error:
         st.error(st.session_state.last_error)
 
-    _render_logs_panel(sidebar["view_logs"])
+    log_col1, log_col2 = st.columns(2)
+    with log_col1:
+        if st.button("Show Logs", key="show_logs_button", use_container_width=True):
+            st.session_state.show_logs = True
+    with log_col2:
+        if st.button("Hide Logs", key="hide_logs_button", use_container_width=True):
+            st.session_state.show_logs = False
+
+    _render_logs_panel(st.session_state.show_logs)
 
     result = st.session_state.last_result
 

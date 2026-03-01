@@ -108,7 +108,22 @@ async def run_in_modal(
 
     sandbox_artifact_dir = "/tmp/KairoScale_artifacts"
 
-    app = await modal.App.lookup.aio("KairoScale-sandbox", create_if_missing=True)
+    connect_timeout_seconds = min(120, max(20, timeout_seconds // 3))
+    logger.info(
+        f"Resolving Modal app handle (timeout={connect_timeout_seconds}s)..."
+    )
+    try:
+        app = await asyncio.wait_for(
+            modal.App.lookup.aio("KairoScale-sandbox", create_if_missing=True),
+            timeout=connect_timeout_seconds,
+        )
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(
+            "Timed out connecting to Modal API during app lookup. "
+            "Check internet connectivity, run `modal token info`, and confirm Modal auth is configured."
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(f"Failed to initialize Modal app handle: {exc}") from exc
 
     try:
         wrapper_done_flag = "/tmp/KairoScale_wrapper_done"
@@ -121,21 +136,34 @@ async def run_in_modal(
             "sleep 600"
         )
 
-        sb = await modal.Sandbox.create.aio(
-            "bash",
-            "-lc",
-            runner_cmd,
-            image=image,
-            gpu=modal_gpu,
-            timeout=timeout_seconds,
-            env={
-                "ARTIFACT_DIR": sandbox_artifact_dir,
-                "REPO_DIR": "/root/repo",
-                "PYTHONPATH": "/root/repo",
-            },
-            app=app,
-            **({"volumes": volume_mounts} if volume_mounts else {}),
+        create_timeout_seconds = min(180, max(30, timeout_seconds // 2))
+        logger.info(
+            f"Submitting Modal sandbox create request (timeout={create_timeout_seconds}s)..."
         )
+        try:
+            sb = await asyncio.wait_for(
+                modal.Sandbox.create.aio(
+                    "bash",
+                    "-lc",
+                    runner_cmd,
+                    image=image,
+                    gpu=modal_gpu,
+                    timeout=timeout_seconds,
+                    env={
+                        "ARTIFACT_DIR": sandbox_artifact_dir,
+                        "REPO_DIR": "/root/repo",
+                        "PYTHONPATH": "/root/repo",
+                    },
+                    app=app,
+                    **({"volumes": volume_mounts} if volume_mounts else {}),
+                ),
+                timeout=create_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                "Timed out waiting for Modal to create a sandbox. "
+                "The Modal control plane may be unreachable or overloaded."
+            ) from exc
 
         # Wait for the wrapper script to complete while keeping sandbox alive.
         start = time.monotonic()

@@ -109,6 +109,28 @@ def _build_configs_zip(config_dir: Path) -> bytes:
     return buffer.getvalue()
 
 
+def _render_phase_guide() -> None:
+    with st.expander("How The Pipeline Works", expanded=True):
+        st.markdown(
+            """
+**Phase 1 - Profile**
+- Runs your training entry point in a sandbox and captures runtime metrics.
+- Outputs baseline stats like utilization, memory, and step timing.
+
+**Phase 2 - Analyze**
+- Uses the selected provider to diagnose bottlenecks from profile evidence.
+- Proposes optimization configs with rationale and risk level.
+
+**Phase 3 - Validate**
+- Replays control + candidate configs in parallel sandboxes.
+- Measures speed, cost, memory, and correctness signals before ranking.
+
+**Phase 4 - Report**
+- Produces an executive summary, comparison tables, and recommended next steps.
+"""
+        )
+
+
 async def _execute_pipeline_phased(
     config: Any,
     status_container,
@@ -634,6 +656,36 @@ def _render_result(result: DashboardResult, cost_cap_ratio: float) -> None:
                         language="bash",
                     )
 
+                    if st.button(
+                        "Apply Winning Config to Repo",
+                        key=f"apply_winner_in_place_{winner_id}",
+                        use_container_width=True,
+                    ):
+                        apply_status = st.empty()
+                        try:
+                            from KairoScale.validator.patcher import apply_config_in_place
+
+                            with open(winner_path, encoding="utf-8") as f:
+                                winning_config = OptimizationConfig.from_dict(json.load(f))
+
+                            written_files = apply_config_in_place(Path(apply_repo), winning_config)
+                            if written_files:
+                                apply_status.success(
+                                    f"Applied {winning_config.id} to {apply_repo}. "
+                                    f"Wrote {len(written_files)} file(s)."
+                                )
+                                st.code(
+                                    "\n".join(str(p) for p in written_files),
+                                    language="text",
+                                )
+                            else:
+                                apply_status.info(
+                                    f"Applied {winning_config.id} to {apply_repo}. "
+                                    "No files were changed."
+                                )
+                        except Exception as exc:
+                            apply_status.error(f"Apply failed: {exc}")
+
     # Deploy section
     st.subheader("Deploy Winning Config")
     best_config_id = result.run_summary.best_overall_config_id
@@ -1006,6 +1058,7 @@ def main() -> None:
     st.set_page_config(page_title="KairoScale Command Center", layout="wide")
     st.title("KairoScale Optimization")
     st.caption("Optimization with configurable objectives and explicit cost guardrails")
+    _render_phase_guide()
 
     sidebar = _render_sidebar()
 

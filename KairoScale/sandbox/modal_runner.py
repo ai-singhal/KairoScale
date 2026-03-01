@@ -136,7 +136,9 @@ async def run_in_modal(
             "sleep 600"
         )
 
-        create_timeout_seconds = min(180, max(30, timeout_seconds // 2))
+        # Cold starts (new image pull/build + GPU provisioning) can exceed 3 minutes.
+        # Keep a buffer for execution while allowing enough time for sandbox creation.
+        create_timeout_seconds = max(180, timeout_seconds - 60)
         logger.info(
             f"Submitting Modal sandbox create request (timeout={create_timeout_seconds}s)..."
         )
@@ -162,7 +164,8 @@ async def run_in_modal(
         except asyncio.TimeoutError as exc:
             raise RuntimeError(
                 "Timed out waiting for Modal to create a sandbox. "
-                "The Modal control plane may be unreachable or overloaded."
+                "The Modal control plane may be unreachable or overloaded, "
+                "or the image/GPU cold start took too long."
             ) from exc
 
         # Wait for the wrapper script to complete while keeping sandbox alive.

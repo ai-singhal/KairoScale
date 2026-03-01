@@ -86,6 +86,11 @@ async def run_in_modal(
     # Add repo files and wrapper script into the image
     image = image.add_local_dir(str(repo_path), remote_path="/root/repo")
 
+    # Mount KairoScale package so Triton optimizer imports work in sandbox
+    _kairoscale_pkg = Path(__file__).resolve().parent.parent
+    if _kairoscale_pkg.is_dir() and (_kairoscale_pkg / "__init__.py").exists():
+        image = image.add_local_dir(str(_kairoscale_pkg), remote_path="/root/KairoScale")
+
     # Create artifact directory locally
     local_artifact_dir = Path(tempfile.mkdtemp(prefix="KairoScale_modal_artifacts_"))
 

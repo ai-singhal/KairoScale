@@ -7,6 +7,8 @@ from KairoScale.optimizer.objective import (
     summarize_run,
 )
 from KairoScale.optimizer.policy import apply_hardware_priors
+from KairoScale.optimizer.triton_adafactor import TritonAdafactor
+from KairoScale.optimizer.triton_muon import TritonMuon
 
 __all__ = [
     "build_native_baseline_candidates",
@@ -14,4 +16,6 @@ __all__ = [
     "score_validation_results",
     "summarize_run",
     "apply_ablation_estimates",
+    "TritonAdafactor",
+    "TritonMuon",
 ]

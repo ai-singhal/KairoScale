@@ -584,22 +584,66 @@ def generate_heuristic_configs(
         ))
 
     if has_optimizer:
+        # Triton Adafactor variant (memory-efficient, fused kernels)
         add(OptimizationConfig(
             id=f"opt-{len(configs) + 1:03d}",
-            name="Swap optimizer + Triton fused kernels",
+            name="Triton Adafactor optimizer (factored second moments)",
             description=(
-                "Evaluate SGD/RMSProp/AdamW/Adafactor/MUON variants plus Triton-fused "
-                "optimizer kernels where available."
+                "Replace current optimizer with Triton-fused Adafactor. Uses "
+                "factored second-moment estimation for lower memory usage and "
+                "fused GPU kernels for reduced launch overhead. HF AdamW used "
+                "as fallback for non-Adafactor param groups."
             ),
             optimization_type=OptimizationType.KERNEL_FUSION,
             evidence=optimizer_evidence,
             config_overrides={
                 "optimizer_strategy": "fused_triton_search",
-                "optimizer_candidates": ["sgd", "rmsprop", "adamw", "adafactor", "muon"],
+                "optimizer_candidates": ["adafactor", "adamw", "sgd", "rmsprop", "muon"],
+                "optimizer_selected": "adafactor",
             },
             estimated_speedup=1.12,
+            estimated_memory_delta=-0.15,
+            risk_level=RiskLevel.MEDIUM,
+        ))
+        # Triton MUON variant (Newton-Schulz orthogonalized momentum)
+        add(OptimizationConfig(
+            id=f"opt-{len(configs) + 1:03d}",
+            name="Triton MUON optimizer (orthogonalized momentum)",
+            description=(
+                "Replace current optimizer with Triton-fused MUON. Applies "
+                "Newton-Schulz orthogonalization to momentum updates for "
+                "decorrelated gradient directions. Fused Triton kernels "
+                "minimize kernel launch overhead."
+            ),
+            optimization_type=OptimizationType.KERNEL_FUSION,
+            evidence=optimizer_evidence,
+            config_overrides={
+                "optimizer_strategy": "fused_triton_search",
+                "optimizer_candidates": ["muon", "adamw", "sgd", "rmsprop", "adafactor"],
+                "optimizer_selected": "muon",
+            },
+            estimated_speedup=1.15,
             estimated_memory_delta=-0.05,
             risk_level=RiskLevel.MEDIUM,
+        ))
+        # HF AdamW + fused SGD/RMSProp baseline (no exotic optimizer)
+        add(OptimizationConfig(
+            id=f"opt-{len(configs) + 1:03d}",
+            name="HF AdamW + fused SGD/RMSProp kernels",
+            description=(
+                "Swap PyTorch AdamW for HuggingFace AdamW and enable fused=True "
+                "for SGD/RMSProp. Lower-risk optimizer swap that reduces kernel "
+                "launch overhead without changing optimizer semantics."
+            ),
+            optimization_type=OptimizationType.KERNEL_FUSION,
+            evidence=optimizer_evidence,
+            config_overrides={
+                "optimizer_strategy": "fused_triton_search",
+                "optimizer_candidates": ["adamw", "sgd", "rmsprop"],
+            },
+            estimated_speedup=1.08,
+            estimated_memory_delta=0.0,
+            risk_level=RiskLevel.LOW,
         ))
 
     flop_util = getattr(profile, "flop_utilization", None)

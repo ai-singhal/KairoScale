@@ -346,13 +346,20 @@ async def run_profile_phase(config: RunConfig):
         profile_steps=config.profile_steps,
     )
 
+    # Scale timeout with requested profiling window to support production runs.
+    total_profile_steps = config.warmup_steps + config.profile_steps
+    profile_timeout_seconds = max(
+        300,
+        min(3600, 120 + total_profile_steps * 12),
+    )
+
     # Run in sandbox
     if config.local:
         from gpunity.sandbox.local_runner import run_locally
         artifact_dir = await run_locally(
             repo_path=repo_path,
             script_content=wrapper_script,
-            timeout_seconds=300,
+            timeout_seconds=profile_timeout_seconds,
             python_bin=config.python_bin,
         )
     else:
@@ -361,7 +368,7 @@ async def run_profile_phase(config: RunConfig):
             repo_path=repo_path,
             script_content=wrapper_script,
             gpu_type=config.gpu_type,
-            timeout_seconds=300,
+            timeout_seconds=profile_timeout_seconds,
             cost_ceiling_usd=config.max_cost_per_sandbox,
         )
 

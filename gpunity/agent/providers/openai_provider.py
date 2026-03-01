@@ -73,17 +73,46 @@ class OpenAIProvider:
         # Convert messages - merge system into messages format
         openai_messages = []
         for msg in messages:
-            if msg["role"] == "system":
-                openai_messages.append({"role": "system", "content": msg["content"]})
-            elif msg["role"] == "user":
-                openai_messages.append({"role": "user", "content": msg["content"]})
-            elif msg["role"] == "assistant":
-                openai_messages.append({"role": "assistant", "content": msg.get("content", "")})
-            elif msg["role"] == "tool":
+            role = msg.get("role")
+            if role == "system":
+                openai_messages.append({"role": "system", "content": msg.get("content", "")})
+            elif role == "user":
+                content = msg.get("content", "")
+                # Agent loop may pass Anthropic-style tool_result payloads as user content.
+                if isinstance(content, list) and content:
+                    first = content[0]
+                    if isinstance(first, dict) and first.get("type") == "tool_result":
+                        openai_messages.append({
+                            "role": "tool",
+                            "tool_call_id": first.get("tool_use_id", ""),
+                            "content": first.get("content", ""),
+                        })
+                        continue
+                openai_messages.append({"role": "user", "content": content})
+            elif role == "assistant":
+                assistant_msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": msg.get("content", ""),
+                }
+                raw_tool_calls = msg.get("tool_calls")
+                if isinstance(raw_tool_calls, list) and raw_tool_calls:
+                    assistant_msg["tool_calls"] = [
+                        {
+                            "id": tc.get("id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": tc.get("name", ""),
+                                "arguments": json.dumps(tc.get("input", {})),
+                            },
+                        }
+                        for tc in raw_tool_calls
+                    ]
+                openai_messages.append(assistant_msg)
+            elif role == "tool":
                 openai_messages.append({
                     "role": "tool",
                     "tool_call_id": msg.get("tool_use_id", ""),
-                    "content": msg["content"],
+                    "content": msg.get("content", ""),
                 })
 
         kwargs: dict[str, Any] = {

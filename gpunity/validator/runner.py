@@ -83,13 +83,19 @@ async def _run_single(
         deterministic_validation=run_config.deterministic_validation,
     )
 
+    # Scale timeout with validation horizon for production-length replays.
+    validation_timeout_seconds = max(
+        600,
+        min(5400, 180 + steps * 20),
+    )
+
     if run_config.local:
         from gpunity.sandbox.local_runner import run_locally
 
         artifact_dir = await run_locally(
             repo_path=repo_path,
             script_content=wrapper,
-            timeout_seconds=600,
+            timeout_seconds=validation_timeout_seconds,
             python_bin=run_config.python_bin,
         )
     else:
@@ -107,7 +113,7 @@ async def _run_single(
             repo_path=repo_path,
             script_content=wrapper,
             gpu_type=run_config.gpu_type,
-            timeout_seconds=600,
+            timeout_seconds=validation_timeout_seconds,
             cost_ceiling_usd=run_config.max_cost_per_sandbox,
             extra_deps=extra_deps,
         )

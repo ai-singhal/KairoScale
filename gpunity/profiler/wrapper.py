@@ -326,17 +326,33 @@ def create_profiling_wrapper(
             if profiler_ctx is not None:
                 try:
                     averages = profiler_ctx.key_averages()
-                    total_cuda = sum(
-                        ev.cuda_time_total for ev in averages if ev.cuda_time_total > 0
-                    )
+
+                    def _event_cuda_time_us(ev):
+                        for attr in ("cuda_time_total", "device_time_total"):
+                            val = getattr(ev, attr, None)
+                            if val is not None:
+                                return float(val)
+                        return 0.0
+
+                    def _event_cpu_time_us(ev):
+                        for attr in ("cpu_time_total", "self_cpu_time_total"):
+                            val = getattr(ev, attr, None)
+                            if val is not None:
+                                return float(val)
+                        return 0.0
+
+                    total_cuda = sum(_event_cuda_time_us(ev) for ev in averages if _event_cuda_time_us(ev) > 0)
                     ops = []
-                    for ev in sorted(averages, key=lambda e: e.cuda_time_total, reverse=True)[:20]:
-                        if ev.cuda_time_total > 0:
+                    ranked = sorted(averages, key=lambda e: _event_cuda_time_us(e), reverse=True)[:20]
+                    for ev in ranked:
+                        cuda_us = _event_cuda_time_us(ev)
+                        cpu_us = _event_cpu_time_us(ev)
+                        if cuda_us > 0:
                             ops.append({{
                                 "name": ev.key,
-                                "gpu_time_ms": ev.cuda_time_total / 1000.0,
-                                "cpu_time_ms": ev.cpu_time_total / 1000.0,
-                                "pct_total": (ev.cuda_time_total / total_cuda * 100) if total_cuda > 0 else 0,
+                                "gpu_time_ms": cuda_us / 1000.0,
+                                "cpu_time_ms": cpu_us / 1000.0,
+                                "pct_total": (cuda_us / total_cuda * 100) if total_cuda > 0 else 0,
                                 "call_count": ev.count,
                                 "flops": getattr(ev, "flops", None) or 0,
                             }})

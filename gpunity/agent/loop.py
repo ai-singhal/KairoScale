@@ -35,11 +35,11 @@ def _get_provider(config: RunConfig):
     if config.provider == "openai":
         from gpunity.agent.providers.openai_provider import OpenAIProvider
 
-        return OpenAIProvider(model=config.model or "gpt-4o")
+        return OpenAIProvider(model=config.model or "gpt-5.2")
     if config.provider == "custom":
         from gpunity.agent.providers.openai_provider import OpenAIProvider
 
-        return OpenAIProvider(model=config.model or "gpt-4o-mini")
+        return OpenAIProvider(model=config.model or "gpt-5.2-mini")
     if config.provider == "modal":
         from gpunity.agent.providers.modal_provider import ModalProvider
 

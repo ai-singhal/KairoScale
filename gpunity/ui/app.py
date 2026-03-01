@@ -323,7 +323,7 @@ def _render_chart(points: list[dict[str, Any]], frontier: list[dict[str, Any]], 
         )
 
     spec: dict[str, Any] = {"layer": layers}
-    st.vega_lite_chart(spec, width="stretch")
+    st.vega_lite_chart(spec, use_container_width=True)
 
 
 def _format_money(value: float) -> str:
@@ -384,7 +384,7 @@ def _render_result(result: DashboardResult, cost_cap_ratio: float) -> None:
             }
             for p in points
         ]
-        st.dataframe(rows, width="stretch", hide_index=True)
+        st.dataframe(rows, use_container_width=True)
 
     with right:
         st.subheader("Recommended")
@@ -429,7 +429,7 @@ def _render_result(result: DashboardResult, cost_cap_ratio: float) -> None:
                 }
                 for e in result.run_summary.evidence_edges
             ]
-            st.dataframe(edges, width="stretch", hide_index=True)
+            st.dataframe(edges, use_container_width=True)
         else:
             st.caption("No evidence edges recorded.")
 
@@ -441,11 +441,12 @@ def _render_result(result: DashboardResult, cost_cap_ratio: float) -> None:
 def _render_sidebar() -> dict[str, Any]:
     st.sidebar.header("Run Controls")
 
-    repo_path = st.sidebar.text_input("Repo path", value=str(Path.cwd()))
-    entry_point = st.sidebar.text_input("Entry point", value="train.py")
+    _default_repo = str(Path(__file__).resolve().parents[2] / "sample_codebases" / "nano_gpt")
+    repo_path = st.sidebar.text_input("Repo path", value=_default_repo)
+    entry_point = st.sidebar.text_input("Entry point", value="gpunity_entry_nanogpt.py")
     output_path = st.sidebar.text_input("Report path", value="./logs/streamlit_report.md")
     provider = st.sidebar.selectbox(
-        "Provider", ["modal", "heuristic", "claude", "openai", "custom"], index=0
+        "Provider", ["openai", "heuristic", "modal", "claude", "custom"], index=0
     )
 
     modal_vllm_url = ""
@@ -466,7 +467,7 @@ def _render_sidebar() -> dict[str, Any]:
         index=0,
     )
     gpu_type = st.sidebar.selectbox("GPU type", ["a100-80gb", "a100-40gb", "h100", "a10g"], index=0)
-    local_mode = st.sidebar.checkbox("Local sandbox", value=True)
+    local_mode = st.sidebar.checkbox("Local sandbox", value=False)
     verbose = st.sidebar.checkbox("Verbose logs", value=False)
     profile_steps = st.sidebar.slider("Profile steps", min_value=5, max_value=200, value=20)
     validation_steps = st.sidebar.slider("Validation steps", min_value=10, max_value=400, value=50)
@@ -647,9 +648,10 @@ def main() -> None:
 
         try:
             config = load_config(cli_args)
-            with st.status("Running GPUnity pipeline...", expanded=True) as status:
-                result = _run_coro(_execute_pipeline_phased(config, status))
-                status.update(label="Pipeline complete!", state="complete")
+            status_container = st.container()
+            status_container.info("Running GPUnity pipeline...")
+            result = _run_coro(_execute_pipeline_phased(config, status_container))
+            status_container.success("Pipeline complete!")
             st.session_state.last_result = result
             st.session_state.last_error = None
         except Exception as exc:
@@ -664,7 +666,7 @@ def main() -> None:
     is_demo = result is None
     if is_demo:
         st.info("Press 'Run Optimization' in the sidebar to start a live run, or view the demo data below.")
-        st.divider()
+        st.markdown("---")
         result = _build_demo_result()
 
     if is_demo:

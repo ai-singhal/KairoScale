@@ -66,10 +66,18 @@ async def run_in_modal(
     repo_path = Path(repo_path).resolve()
     image_spec = build_image_spec(repo_path, extra_deps)
 
-    # Build Modal image with repo and script baked in
-    image = modal.Image.debian_slim(python_version=image_spec["python_version"])
-    if image_spec["pip_packages"]:
-        image = image.pip_install(*image_spec["pip_packages"])
+    # Use PyTorch CUDA runtime image so Modal caches the heavy CUDA/torch layers.
+    # Only pip-install user deps that aren't torch itself.
+    non_torch_deps = [
+        dep for dep in image_spec["pip_packages"]
+        if not any(t in dep.lower() for t in ("torch", "nvidia", "triton"))
+    ]
+    image = modal.Image.from_registry(
+        "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime",
+        add_python="3.11",
+    )
+    if non_torch_deps:
+        image = image.pip_install(*non_torch_deps)
 
     # Add repo files and wrapper script into the image
     image = image.add_local_dir(str(repo_path), remote_path="/root/repo")

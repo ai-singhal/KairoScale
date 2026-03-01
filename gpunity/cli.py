@@ -41,7 +41,7 @@ def _export_configs(configs, output_dir: Path) -> Path:
 @click.option("--entry", "entry_point", default="train.py", help="Training script entry point.")
 @click.option("--train-function", default=None, help="Function containing the training loop.")
 @click.option("--provider", default="claude",
-              type=click.Choice(["claude", "openai", "heuristic", "custom"]),
+              type=click.Choice(["claude", "openai", "heuristic", "custom", "modal"]),
               help="LLM provider.")
 @click.option("--model", default=None, help="Model override for the provider.")
 @click.option("--mode", default="auto", type=click.Choice(["auto", "train", "infer"]),
@@ -152,7 +152,7 @@ def profile(repo_path: str, **kwargs: object) -> None:
 @click.option("--repo", "repo_path", required=True, type=click.Path(exists=True),
               help="Path to the repo.")
 @click.option("--provider", default="claude",
-              type=click.Choice(["claude", "openai", "heuristic", "custom"]),
+              type=click.Choice(["claude", "openai", "heuristic", "custom", "modal"]),
               help="LLM provider.")
 @click.option("--model", default=None, help="Model override.")
 @click.option("--max-configs", default=10, type=int, help="Total configs to generate.")

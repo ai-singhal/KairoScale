@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,14 +58,27 @@ def _export_configs(configs: list[OptimizationConfig], output_dir: Path) -> Path
     return output_dir
 
 
-async def _execute_pipeline(config: Any) -> DashboardResult:
+async def _execute_pipeline_phased(config: Any, status_container) -> DashboardResult:
+    """Execute pipeline with phased progress updates for the UI."""
     from gpunity.cli import run_profile_phase
     from gpunity.diagnosis.bottleneck import diagnose_bottleneck
     from gpunity.hardware.profile import detect_hardware_profile, resolve_workload_mode
     from gpunity.reporter.markdown import generate_report
     from gpunity.validator.runner import run_validation
 
+    sandbox_mode = "Modal Sandbox" if not config.local else "Local Sandbox"
+    provider_label = config.provider.capitalize()
+
+    status_container.write(f"Phase 1: Profiling training script in {sandbox_mode}...")
     profile_result = await run_profile_phase(config)
+    gpu_util = getattr(profile_result, "gpu_utilization", None)
+    peak_mem = getattr(profile_result, "peak_memory_mb", None)
+    phase1_msg = "Phase 1 complete."
+    if gpu_util is not None:
+        phase1_msg += f" GPU util: {gpu_util:.0f}%"
+    if peak_mem is not None:
+        phase1_msg += f", Peak VRAM: {peak_mem:.0f} MB"
+    status_container.write(phase1_msg)
 
     hardware = detect_hardware_profile(config)
     mode = resolve_workload_mode(config.mode, profile_result)
@@ -72,9 +86,14 @@ async def _execute_pipeline(config: Any) -> DashboardResult:
     diagnosis = None
     if config.gpu_selection == "auto":
         diagnosis = diagnose_bottleneck(profile_result, hardware, config.gpu_aggressiveness)
+        if diagnosis:
+            status_container.write(
+                f"Bottleneck: {diagnosis.primary.value} (confidence: {diagnosis.confidence})"
+            )
 
     from gpunity.agent.loop import run_agent_loop
 
+    status_container.write(f"Phase 2: {provider_label} LLM analyzing profile and proposing optimizations...")
     optimization_configs = await run_agent_loop(
         profile_result,
         Path(config.repo_path),
@@ -83,12 +102,16 @@ async def _execute_pipeline(config: Any) -> DashboardResult:
         mode=mode,
         diagnosis=diagnosis,
     )
+    status_container.write(f"Phase 2 complete. Generated {len(optimization_configs)} optimization configs.")
 
     config_export_dir = _export_configs(
         optimization_configs,
         Path(config.output_path).parent / "gpunity_configs",
     )
 
+    status_container.write(
+        f"Phase 3: Validating {len(optimization_configs)} configs + control in parallel {sandbox_mode}s..."
+    )
     control_run, validation_results, run_summary = await run_validation(
         Path(config.repo_path),
         optimization_configs,
@@ -98,7 +121,12 @@ async def _execute_pipeline(config: Any) -> DashboardResult:
         mode=mode,
         diagnosis=diagnosis,
     )
+    n_diverged = sum(1 for r in validation_results if r.diverged)
+    status_container.write(
+        f"Phase 3 complete. {len(validation_results)} validated, {n_diverged} diverged."
+    )
 
+    status_container.write("Phase 4: Generating report...")
     output_path = Path(config.output_path)
     report_path = generate_report(
         run_config=config,
@@ -414,8 +442,19 @@ def _render_sidebar() -> dict[str, Any]:
     st.sidebar.header("Run Controls")
 
     repo_path = st.sidebar.text_input("Repo path", value=str(Path.cwd()))
+    entry_point = st.sidebar.text_input("Entry point", value="train.py")
     output_path = st.sidebar.text_input("Report path", value="./logs/streamlit_report.md")
-    provider = st.sidebar.selectbox("Provider", ["heuristic", "claude", "openai", "custom"], index=0)
+    provider = st.sidebar.selectbox(
+        "Provider", ["modal", "heuristic", "claude", "openai", "custom"], index=0
+    )
+
+    modal_vllm_url = ""
+    if provider == "modal":
+        modal_vllm_url = st.sidebar.text_input(
+            "Modal vLLM URL",
+            value=os.environ.get("MODAL_VLLM_URL", ""),
+            help="Deploy modal_app.py and paste the endpoint URL here.",
+        )
     objective_profile = st.sidebar.selectbox(
         "Objective profile",
         ["latency", "balanced", "cost", "throughput"],
@@ -441,13 +480,15 @@ def _render_sidebar() -> dict[str, Any]:
         step=5,
     )
 
-    run_clicked = st.sidebar.button("Run Optimization", type="primary", width="stretch")
+    run_clicked = st.sidebar.button("Run Optimization", type="primary", use_container_width=True)
 
     return {
         "run_clicked": run_clicked,
         "repo_path": repo_path,
+        "entry_point": entry_point,
         "output_path": output_path,
         "provider": provider,
+        "modal_vllm_url": modal_vllm_url,
         "objective_profile": objective_profile,
         "validation_strategy": validation_strategy,
         "gpu_type": gpu_type,
@@ -578,10 +619,14 @@ def main() -> None:
         st.session_state.last_error = None
 
     if sidebar["run_clicked"]:
+        # Set Modal vLLM URL in env if provided
+        if sidebar.get("modal_vllm_url"):
+            os.environ["MODAL_VLLM_URL"] = sidebar["modal_vllm_url"]
+
         cli_args = {
             "repo_path": sidebar["repo_path"],
             "output_path": sidebar["output_path"],
-            "entry_point": "train.py",
+            "entry_point": sidebar["entry_point"],
             "provider": sidebar["provider"],
             "objective_profile": sidebar["objective_profile"],
             "validation_strategy": sidebar["validation_strategy"],
@@ -602,8 +647,9 @@ def main() -> None:
 
         try:
             config = load_config(cli_args)
-            with st.spinner("Running profile -> analyze -> validate -> report..."):
-                result = _run_coro(_execute_pipeline(config))
+            with st.status("Running GPUnity pipeline...", expanded=True) as status:
+                result = _run_coro(_execute_pipeline_phased(config, status))
+                status.update(label="Pipeline complete!", state="complete")
             st.session_state.last_result = result
             st.session_state.last_error = None
         except Exception as exc:

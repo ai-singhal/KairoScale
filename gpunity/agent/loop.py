@@ -40,6 +40,10 @@ def _get_provider(config: RunConfig):
         from gpunity.agent.providers.openai_provider import OpenAIProvider
 
         return OpenAIProvider(model=config.model or "gpt-4o-mini")
+    if config.provider == "modal":
+        from gpunity.agent.providers.modal_provider import ModalProvider
+
+        return ModalProvider(model=config.model or "Qwen/Qwen3-8B")
     raise ValueError(f"Unknown provider: {config.provider}")
 
 

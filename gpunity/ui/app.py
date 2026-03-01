@@ -609,7 +609,7 @@ def _build_demo_result() -> DashboardResult:
 
 def main() -> None:
     st.set_page_config(page_title="GPUnity Command Center", layout="wide")
-    st.title("GPUnity Optimization Command Center")
+    st.title("GPUnity Optimization")
     st.caption("Time-first optimization under explicit cost guardrails for fast demo decisions.")
 
     sidebar = _render_sidebar()

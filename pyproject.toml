@@ -20,11 +20,13 @@ claude = ["anthropic>=0.39"]
 openai = ["openai>=1.12"]
 modal = ["modal>=0.64"]
 charts = ["matplotlib>=3.8"]
+ui = ["streamlit>=1.42"]
 all = [
     "anthropic>=0.39",
     "openai>=1.12",
     "modal>=0.64",
     "matplotlib>=3.8",
+    "streamlit>=1.42",
 ]
 dev = [
     "pytest>=8.0",

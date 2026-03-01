@@ -663,19 +663,10 @@ def main() -> None:
 
     result = st.session_state.last_result
 
-    is_demo = result is None
-    if is_demo:
-        st.info("Press 'Run Optimization' in the sidebar to start a live run, or view the demo data below.")
-        st.markdown("---")
-        result = _build_demo_result()
-
-    if is_demo:
-        st.warning("DEMO DATA — results below are synthetic. Run a real repo to see live analysis.")
-
-    _render_result(result, sidebar["cost_cap_ratio"])
-
-    if is_demo:
-        st.caption("Demo data shown above. Configure a repo path and press Run Optimization to analyze real training code.")
+    if result is None:
+        st.info("Configure settings in the sidebar and press **Run Optimization** to start.")
+    else:
+        _render_result(result, sidebar["cost_cap_ratio"])
 
 
 if __name__ == "__main__":

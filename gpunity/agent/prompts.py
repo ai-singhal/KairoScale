@@ -7,22 +7,44 @@ def get_system_prompt(
     profile_summary: str,
     mode: str = "train",
     objective_profile: str = "balanced",
+    bottleneck_summary: str = "",
 ) -> str:
     """Build the system prompt for the optimization agent.
 
     Args:
         profile_summary: Human-readable profile summary from ProfileResult.summary().
+        mode: Workload mode (train or infer).
+        objective_profile: Optimization objective.
+        bottleneck_summary: Human-readable bottleneck diagnosis summary.
 
     Returns:
         Complete system prompt string.
     """
+    bottleneck_section = ""
+    if bottleneck_summary:
+        bottleneck_section = f"""
+BOTTLENECK DIAGNOSIS:
+The profiler has diagnosed the following resource bottleneck. Your optimization
+proposals MUST primarily address this bottleneck. Optimizations that don't address
+the diagnosed bottleneck will have minimal impact.
+
+{bottleneck_summary}
+
+IMPORTANT: Focus your proposals on the diagnosed bottleneck first. For example:
+- DATA_STARVED: prioritize DataLoader optimizations (more workers, prefetch, pin_memory)
+- VRAM_STARVED: prioritize memory reduction (AMP, gradient checkpointing, activation offload)
+- COMPUTE_BOUND: workload is already efficient — focus on cost reduction via cheaper GPU
+- TRANSFER_BOUND: prioritize transfer overlap (pinned memory, non_blocking, prefetch)
+- COMPILE_BOUND: use simpler compile modes or skip compile for this workload size
+"""
+
     return f"""You are an expert ML systems engineer specializing in PyTorch training optimization.
 
 You have been given profiling data from an ML training script. Your job is to analyze the profile, read the source code, and propose concrete optimization configurations that will improve training speed, reduce memory usage, or lower cost -- grounded in the profile evidence.
 
 CRITICAL RULES:
 1. Every optimization you propose MUST cite specific evidence from the profile data. Do not hallucinate or guess.
-2. Prefer config-only changes (e.g., precision or dataloader settings) over code changes when possible.
+2. Both config-only changes AND code-level changes are valid. For double-digit speedups, code changes are often necessary. Propose the highest-impact change regardless of whether it requires code modification.
 3. Baseline compile modes are validated separately; prioritize data processing and non-compile model/runtime changes first unless compile bottlenecks are dominant.
 4. Each proposal must include an estimated speedup and risk level. Be conservative -- do not over-promise.
 5. Consider these optimization categories:
@@ -33,9 +55,18 @@ CRITICAL RULES:
    - DATA_LOADING: more workers, prefetch (signal: high dataloader stall time)
    - INFERENCE_STACK: MLA attention, n-gram/speculative paths, float8 kernel libraries (signal: inference-time attention/cache bottlenecks)
    - MEMORY: gradient checkpointing, activation offload (signal: peak memory near GPU limit)
+   - MEMORY_FORMAT: channels_last / channels_last_3d memory layout (signal: conv2d/conv3d ops dominate GPU time)
    - KERNEL_FUSION: fused ops (signal: many small sequential ops)
 6. Do NOT suggest optimizations unless the profile data supports them.
 7. Use Supermemory retrieval when it helps ground framework/library recommendations, then cite the retrieved evidence.
+8. For CONV-HEAVY workloads (conv2d/conv3d in top operators): prioritize memory format conversion (channels_last/channels_last_3d), cuDNN benchmark mode, and stacking these with AMP + torch.compile. These are the highest-impact changes for CNNs.
+
+HIGH-IMPACT CODE CHANGE EXAMPLES:
+- Memory format conversion: `model = model.to(memory_format=torch.channels_last_3d)` (10-30% for 3D CNNs)
+- cuDNN benchmark: `torch.backends.cudnn.benchmark = True` (5-15% for conv-heavy models)
+- GradScaler for AMP training: wrap loss.backward() with scaler.scale() and optimizer.step() with scaler.step()
+- Replace DataParallel with DistributedDataParallel for multi-GPU (up to 2x)
+- Stacking multiple compatible optimizations together for compound gains (30-50%+)
 
 WORKFLOW:
 1. First, call read_profile() to see the profiling summary.
@@ -47,7 +78,7 @@ WORKFLOW:
 
 PROFILE DATA:
 {profile_summary}
-
+{bottleneck_section}
 RUN CONTEXT:
 - Workload mode: {mode}
 - Objective profile: {objective_profile}

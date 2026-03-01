@@ -92,6 +92,11 @@ def _export_configs(configs, output_dir: Path) -> Path:
 @click.option("--local", is_flag=True, help="Use local runner instead of Modal.")
 @click.option("--python-bin", default=None, type=click.Path(exists=True),
               help="Python binary for local wrapper execution.")
+@click.option("--gpu-selection", default="auto", type=click.Choice(["auto", "fixed"]),
+              help="GPU selection mode. 'auto' tests cheaper GPUs when compute-bound.")
+@click.option("--gpu-aggressiveness", default="moderate",
+              type=click.Choice(["none", "conservative", "moderate", "aggressive"]),
+              help="How aggressively to test cheaper GPUs.")
 @click.option("--config-file", default=None, type=click.Path(exists=True),
               help="YAML configuration file.")
 def run(repo_path: str, config_file: Optional[str], **kwargs: object) -> None:
@@ -267,6 +272,21 @@ async def run_pipeline(config: RunConfig) -> Path:
         hardware.detection_source,
     )
 
+    # Phase 1.5: Bottleneck diagnosis
+    diagnosis = None
+    if config.gpu_selection == "auto":
+        from gpunity.diagnosis.bottleneck import diagnose_bottleneck
+        diagnosis = diagnose_bottleneck(
+            profile_result, hardware, config.gpu_aggressiveness
+        )
+        logger.info(
+            "Bottleneck diagnosis: %s (confidence: %s)",
+            diagnosis.primary.value,
+            diagnosis.confidence,
+        )
+        for ev in diagnosis.evidence:
+            logger.info("  Evidence: %s", ev)
+
     # Phase 2: Analyze
     logger.info("Phase 2: Generating optimization configs...")
     from gpunity.agent.loop import run_agent_loop
@@ -276,6 +296,7 @@ async def run_pipeline(config: RunConfig) -> Path:
         config,
         hardware_profile=hardware,
         mode=mode,
+        diagnosis=diagnosis,
     )
     logger.info(f"Phase 2 complete. Generated {len(optimization_configs)} configs.")
     config_export_dir = _export_configs(
@@ -297,6 +318,7 @@ async def run_pipeline(config: RunConfig) -> Path:
             profile=profile_result,
             hardware_profile=hardware,
             mode=mode,
+            diagnosis=diagnosis,
         )
         logger.info(f"Phase 3 complete. {len(validation_results)} configs validated.")
     else:

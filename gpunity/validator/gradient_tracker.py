@@ -162,7 +162,16 @@ def create_gradient_tracking_wrapper(
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(VALIDATION_SEED)
 
-            if DETERMINISTIC_VALIDATION:
+            # Performance overrides that affect determinism
+            _cudnn_benchmark_enabled = _to_bool(
+                _CONFIG_OVERRIDES.get("cudnn_benchmark", False), False
+            )
+            _memory_format_str = str(
+                _CONFIG_OVERRIDES.get("memory_format", "")
+            ).strip().lower()
+            _has_perf_overrides = _cudnn_benchmark_enabled or _memory_format_str != ""
+
+            if DETERMINISTIC_VALIDATION and not _has_perf_overrides:
                 try:
                     torch.use_deterministic_algorithms(True, warn_only=True)
                 except Exception:
@@ -170,6 +179,18 @@ def create_gradient_tracking_wrapper(
                 if hasattr(torch.backends, "cudnn"):
                     torch.backends.cudnn.deterministic = True
                     torch.backends.cudnn.benchmark = False
+            else:
+                # Relax deterministic constraints for perf-oriented configs
+                if hasattr(torch.backends, "cudnn"):
+                    torch.backends.cudnn.deterministic = False
+                    torch.backends.cudnn.benchmark = _cudnn_benchmark_enabled
+
+            # Resolve memory format object
+            _memory_format = None
+            if _memory_format_str == "channels_last_3d":
+                _memory_format = torch.channels_last_3d
+            elif _memory_format_str == "channels_last":
+                _memory_format = torch.channels_last
 
             # DataLoader patch for deterministic replay and runtime overrides.
             _OriginalDataLoader = _tud.DataLoader
@@ -190,6 +211,38 @@ def create_gradient_tracking_wrapper(
                         kwargs["generator"] = _loader_seed_gen
 
                     super().__init__(*args, **kwargs)
+
+                def __iter__(self):
+                    base_iter = super().__iter__()
+                    if _memory_format is None:
+                        return base_iter
+                    return _MemoryFormatIterator(base_iter)
+
+            class _MemoryFormatIterator:
+                def __init__(self, base_iter):
+                    self._base = base_iter
+
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    batch = next(self._base)
+                    return _convert_batch_memory_format(batch)
+
+            def _convert_batch_memory_format(batch):
+                if isinstance(batch, torch.Tensor):
+                    # Only convert tensors with enough dims for the format
+                    if _memory_format == torch.channels_last_3d and batch.ndim == 5:
+                        return batch.to(memory_format=torch.channels_last_3d)
+                    elif _memory_format == torch.channels_last and batch.ndim == 4:
+                        return batch.to(memory_format=torch.channels_last)
+                    return batch
+                elif isinstance(batch, (list, tuple)):
+                    converted = [_convert_batch_memory_format(x) for x in batch]
+                    return type(batch)(converted)
+                elif isinstance(batch, dict):
+                    return {{k: _convert_batch_memory_format(v) for k, v in batch.items()}}
+                return batch
 
             _tud.DataLoader = _GPUnityDataLoader
 
@@ -241,6 +294,14 @@ def create_gradient_tracking_wrapper(
             def _maybe_apply_model_overrides(model):
                 if getattr(model, "_gpunity_overrides_applied", False):
                     return
+
+                # Memory format conversion (must happen before compile)
+                if _memory_format is not None:
+                    try:
+                        model.to(memory_format=_memory_format)
+                        _CONFIG_OVERRIDES["_memory_format_applied"] = _memory_format_str
+                    except Exception as e:
+                        _CONFIG_OVERRIDES["_memory_format_error"] = str(e)
 
                 if _checkpointing_enabled and hasattr(model, "gradient_checkpointing_enable"):
                     try:
@@ -365,7 +426,20 @@ def create_gradient_tracking_wrapper(
                     return _orig_bce_logits(input, *args, **kwargs)
                 _F.binary_cross_entropy_with_logits = _tracked_bce_logits
 
-            # Patch loss.backward to capture loss value
+            # GradScaler for AMP (enables proper fp16/bf16 training with loss scaling)
+            _grad_scaler = [None]
+            if _amp_enabled and torch.cuda.is_available():
+                try:
+                    _scaler_cls = getattr(torch.amp, "GradScaler", None)
+                    if _scaler_cls is None:
+                        _scaler_cls = getattr(torch.cuda.amp, "GradScaler", None)
+                    if _scaler_cls is not None:
+                        _grad_scaler[0] = _scaler_cls()
+                        _CONFIG_OVERRIDES["_grad_scaler_enabled"] = True
+                except Exception:
+                    pass
+
+            # Patch loss.backward to capture loss value and use GradScaler
             _OrigBackward = torch.Tensor.backward
 
             def _tracked_backward(self, *args, **kwargs):
@@ -385,9 +459,50 @@ def create_gradient_tracking_wrapper(
                         _metrics["logit_signatures"].append(None)
                 except Exception:
                     pass
+
+                scaler = _grad_scaler[0]
+                if scaler is not None:
+                    try:
+                        scaled_loss = scaler.scale(self)
+                        return _OrigBackward(scaled_loss, *args, **kwargs)
+                    except Exception:
+                        return _OrigBackward(self, *args, **kwargs)
                 return _OrigBackward(self, *args, **kwargs)
 
             torch.Tensor.backward = _tracked_backward
+
+            # Patch optimizer.step to use GradScaler when active
+            if _grad_scaler[0] is not None:
+                def _patch_optimizer_step_scaler(cls):
+                    orig_step = cls.__dict__.get("step")
+                    if orig_step is None:
+                        return
+                    if getattr(orig_step, "_gpunity_scaler_patched", False):
+                        return
+
+                    def _scaled_step(self, *args, **kwargs):
+                        scaler = _grad_scaler[0]
+                        if scaler is not None:
+                            try:
+                                scaler.unscale_(self)
+                                result = orig_step(self, *args, **kwargs)
+                                scaler.update()
+                                return result
+                            except Exception:
+                                return orig_step(self, *args, **kwargs)
+                        return orig_step(self, *args, **kwargs)
+
+                    _scaled_step._gpunity_scaler_patched = True
+                    _scaled_step._gpunity_patched = getattr(orig_step, "_gpunity_patched", False)
+                    cls.step = _scaled_step
+
+                for _obj in _toptim.__dict__.values():
+                    if (
+                        isinstance(_obj, type)
+                        and issubclass(_obj, _toptim.Optimizer)
+                        and _obj is not _toptim.Optimizer
+                    ):
+                        _patch_optimizer_step_scaler(_obj)
 
         except ImportError:
             pass

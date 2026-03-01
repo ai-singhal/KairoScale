@@ -4,7 +4,9 @@
       "Bash(pip install:*)",
       "Bash(python -m pytest:*)",
       "Bash(.venv/Scripts/pip install:*)",
-      "Bash(.venv/Scripts/python:*)"
+      "Bash(.venv/Scripts/python:*)",
+      "WebSearch",
+      "Bash(python:*)"
     ]
   }
 }

@@ -305,6 +305,96 @@ def _apply_vs_best_native_deltas(
         )
 
 
+async def _run_gpu_downgrade_tests(
+    control_repo: Path,
+    best_config: OptimizationConfig,
+    control: ControlRun,
+    run_config: RunConfig,
+    gpu_candidates: list[str],
+    mode: str,
+) -> list[dict]:
+    """Test the best config on cheaper GPUs to find cost-optimal hardware.
+
+    Only runs on Modal (not local) since GPU selection requires cloud GPUs.
+
+    Returns:
+        List of dicts with gpu_type, speedup, cost_savings, viable.
+    """
+    if run_config.local:
+        logger.info("[gpu-selection] Skipping GPU downgrade tests in local mode")
+        return []
+
+    results = []
+    for gpu_type in gpu_candidates:
+        logger.info(f"[gpu-selection] Testing config {best_config.id} on {gpu_type}")
+        try:
+            # Create a modified run config for this GPU
+            gpu_run_config = RunConfig.from_dict({
+                **run_config.to_dict(),
+                "gpu_type": gpu_type,
+            })
+
+            patched_repo = apply_config(control_repo, best_config)
+            artifact_dir = await _run_single(
+                patched_repo,
+                gpu_run_config.entry_point,
+                run_config.validation_steps,
+                run_config.gradient_check_interval,
+                gpu_run_config,
+                mode,
+                f"gpu-test-{gpu_type}",
+            )
+
+            vr = compute_validation_metrics(
+                artifact_dir, control,
+                config_id=best_config.id,
+                config_name=best_config.name,
+                gpu_type=gpu_type,
+            )
+
+            from gpunity.diagnosis.gpuSelector import estimateCostSavings
+            savings = estimateCostSavings(
+                run_config.gpu_type, gpu_type, control.wall_clock_seconds
+            )
+
+            # Viable if speedup is within 10% of original
+            viable = vr.success and vr.speedup_vs_control >= 0.90
+
+            result = {
+                "gpu_type": gpu_type,
+                "speedup_vs_control": vr.speedup_vs_control if vr.success else 0.0,
+                "viable": viable,
+                "cost_savings_pct": savings["savings_pct"],
+                "cost_savings_usd": savings["savings_usd"],
+                "error": vr.error,
+            }
+            results.append(result)
+            logger.info(
+                f"[gpu-selection] {gpu_type}: speedup={vr.speedup_vs_control:.2f}x, "
+                f"viable={viable}, cost_savings={savings['savings_pct']:.0f}%"
+            )
+
+            if not viable:
+                logger.info(
+                    f"[gpu-selection] {gpu_type} not viable, stopping downgrade search"
+                )
+                break
+
+        except Exception as e:
+            logger.error(f"[gpu-selection] {gpu_type} failed: {e}")
+            results.append({
+                "gpu_type": gpu_type,
+                "speedup_vs_control": 0.0,
+                "viable": False,
+                "cost_savings_pct": 0.0,
+                "cost_savings_usd": 0.0,
+                "error": str(e),
+            })
+            break
+
+    return results
+
+
 async def run_validation(
     control_repo: Path,
     configs: list[OptimizationConfig],
@@ -313,6 +403,7 @@ async def run_validation(
     profile: Optional[ProfileResult] = None,
     hardware_profile: Optional[HardwareProfile] = None,
     mode: str = "train",
+    diagnosis=None,
 ) -> tuple[ControlRun, list[ValidationResult], RunSummary]:
     """Run validation with required native baseline ladder and objective scoring."""
     baseline_manifest: list[BaselineResult] = [
@@ -412,4 +503,43 @@ async def run_validation(
         compare_against_native=run_config.compare_against_native,
     )
     _apply_vs_best_native_deltas(scored, summary.best_native_baseline_id)
+
+    # Attach bottleneck diagnosis to summary
+    if diagnosis is not None:
+        summary.bottleneck_type = diagnosis.primary.value
+        summary.bottleneck_evidence = list(diagnosis.evidence)
+
+        # GPU downgrade tests (only for COMPUTE_BOUND with candidates)
+        from gpunity.diagnosis.bottleneck import BottleneckType
+        if (
+            diagnosis.primary == BottleneckType.COMPUTE_BOUND
+            and diagnosis.gpu_downgrade_candidates
+            and run_config.gpu_aggressiveness != "none"
+            and not run_config.local
+        ):
+            # Find best successful config
+            best = None
+            for r in scored:
+                if r.success and not r.diverged and not r.is_native_baseline:
+                    if best is None or r.speedup_vs_control > best.speedup_vs_control:
+                        best = r
+
+            if best is not None and best.config_id in config_by_id:
+                best_cfg = config_by_id[best.config_id]
+                logger.info(
+                    f"[gpu-selection] Testing GPU downgrades for best config "
+                    f"{best.config_id} ({best.speedup_vs_control:.2f}x speedup)"
+                )
+                gpu_results = await _run_gpu_downgrade_tests(
+                    control_repo, best_cfg, control, run_config,
+                    diagnosis.gpu_downgrade_candidates, mode,
+                )
+                summary.gpu_selection_results = gpu_results
+
+                # Find cheapest viable GPU
+                for gr in reversed(gpu_results):
+                    if gr.get("viable"):
+                        summary.recommended_gpu = gr["gpu_type"]
+                        break
+
     return control, scored, summary

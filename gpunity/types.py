@@ -20,6 +20,7 @@ class OptimizationType(str, Enum):
     DATA_LOADING = "data_loading"
     PARALLELISM = "parallelism"
     MEMORY = "memory"
+    MEMORY_FORMAT = "memory_format"
     KERNEL_FUSION = "kernel_fusion"
     COMMUNICATION = "communication"
 
@@ -92,6 +93,14 @@ class ProfileResult:
     dataloader_stall_time_ms: float = 0.0
     dataloader_bottleneck: bool = False
 
+    # Bottleneck diagnosis inputs
+    h2d_transfer_time_ms: float = 0.0
+    compile_warmup_time_s: float = 0.0
+    gpu_active_ratio: float = 0.0
+    memory_utilization_ratio: float = 0.0
+    cpu_data_pipeline_ms: float = 0.0
+    total_vram_mb: float = 0.0
+
     # Loop detection metadata (D-001)
     loop_detection_method: LoopDetectionMethod = LoopDetectionMethod.NONE
     loop_detection_confidence: Optional[str] = None
@@ -154,6 +163,21 @@ class ProfileResult:
                 lines.append(f"  ... ({len(stack_lines) - 5} more lines)")
             lines.append("")
 
+        # Bottleneck diagnosis inputs
+        if self.gpu_active_ratio > 0:
+            lines.append(f"GPU active ratio: {self.gpu_active_ratio:.1%}")
+        if self.h2d_transfer_time_ms > 0:
+            lines.append(f"H2D transfer time: {self.h2d_transfer_time_ms:.2f} ms/step")
+        if self.compile_warmup_time_s > 0:
+            lines.append(f"Compile warmup time: {self.compile_warmup_time_s:.1f} s")
+        if self.memory_utilization_ratio > 0:
+            lines.append(f"Memory utilization: {self.memory_utilization_ratio:.1%}")
+        if self.cpu_data_pipeline_ms > 0:
+            lines.append(f"CPU data pipeline time: {self.cpu_data_pipeline_ms:.2f} ms/step")
+        if any([self.gpu_active_ratio, self.h2d_transfer_time_ms,
+                self.compile_warmup_time_s, self.memory_utilization_ratio]):
+            lines.append("")
+
         # Loop detection
         lines.append(f"Loop detection: {self.loop_detection_method.value}")
         if self.loop_detection_confidence:
@@ -179,6 +203,8 @@ class ProfileResult:
         d["loop_detection_method"] = LoopDetectionMethod(
             d.get("loop_detection_method", "none")
         )
+        valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        d = {k: v for k, v in d.items() if k in valid_fields}
         return cls(**d)
 
 
@@ -328,6 +354,10 @@ class RunSummary:
     baseline_results: list[BaselineResult] = field(default_factory=list)
     evidence_edges: list[EvidenceEdge] = field(default_factory=list)
     confidence: str = "medium"
+    bottleneck_type: Optional[str] = None
+    bottleneck_evidence: list[str] = field(default_factory=list)
+    gpu_selection_results: list[dict[str, Any]] = field(default_factory=list)
+    recommended_gpu: Optional[str] = None
 
 
 @dataclass
@@ -365,6 +395,8 @@ class RunConfig:
     dry_run: bool = False
     local: bool = False
     python_bin: Optional[str] = None
+    gpu_selection: str = "auto"
+    gpu_aggressiveness: str = "moderate"
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict."""

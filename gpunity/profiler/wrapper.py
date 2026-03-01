@@ -160,6 +160,59 @@ def create_profiling_wrapper(
             pass  # torch not available -- skip patching
 
         # ------------------------------------------------------------------
+        # H2D transfer time tracking (tensor.to / tensor.cuda)
+        # ------------------------------------------------------------------
+        _h2d_stats = {{"transfer_times_ms": []}}
+
+        try:
+            import torch
+
+            _orig_tensor_to = torch.Tensor.to
+
+            def _tracked_tensor_to(self, *args, **kwargs):
+                # Only measure host-to-device transfers
+                is_h2d = False
+                if not self.is_cuda:
+                    for a in args:
+                        if isinstance(a, torch.device) and a.type == "cuda":
+                            is_h2d = True
+                            break
+                        if isinstance(a, str) and "cuda" in a:
+                            is_h2d = True
+                            break
+                    if "device" in kwargs:
+                        dev = kwargs["device"]
+                        if isinstance(dev, torch.device) and dev.type == "cuda":
+                            is_h2d = True
+                        elif isinstance(dev, str) and "cuda" in dev:
+                            is_h2d = True
+
+                if is_h2d:
+                    t0 = time.perf_counter()
+                    result = _orig_tensor_to(self, *args, **kwargs)
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    _h2d_stats["transfer_times_ms"].append(elapsed)
+                    return result
+                return _orig_tensor_to(self, *args, **kwargs)
+
+            torch.Tensor.to = _tracked_tensor_to
+
+            _orig_tensor_cuda = torch.Tensor.cuda
+
+            def _tracked_tensor_cuda(self, *args, **kwargs):
+                if not self.is_cuda:
+                    t0 = time.perf_counter()
+                    result = _orig_tensor_cuda(self, *args, **kwargs)
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    _h2d_stats["transfer_times_ms"].append(elapsed)
+                    return result
+                return _orig_tensor_cuda(self, *args, **kwargs)
+
+            torch.Tensor.cuda = _tracked_tensor_cuda
+        except Exception:
+            pass
+
+        # ------------------------------------------------------------------
         # Step counter injected via optimizer.step monkey-patch
         # ------------------------------------------------------------------
         _step_counter = {{"count": 0, "step_times": [], "last_step_time": None}}
@@ -231,6 +284,12 @@ def create_profiling_wrapper(
                 "dataloader_throughput": 0.0,
                 "dataloader_stall_time_ms": 0.0,
                 "dataloader_bottleneck": False,
+                "h2d_transfer_time_ms": 0.0,
+                "compile_warmup_time_s": 0.0,
+                "gpu_active_ratio": 0.0,
+                "memory_utilization_ratio": 0.0,
+                "cpu_data_pipeline_ms": 0.0,
+                "total_vram_mb": 0.0,
                 "loop_detection_method": "none",
                 "loop_detection_confidence": None,
             }}
@@ -365,6 +424,11 @@ def create_profiling_wrapper(
                         profile_data["gpu_utilization"] = min(
                             (total_cuda / total_wall) * 100, 100.0
                         )
+                        # GPU active ratio: fraction of wall time where CUDA kernels are running
+                        # Evidence source: torch.profiler CUDA time vs wall clock time
+                        profile_data["gpu_active_ratio"] = min(
+                            total_cuda / total_wall, 1.0
+                        ) if total_wall > 0 else 0.0
                 except Exception as e:
                     print(f"[gpunity] Profiler extraction error: {{e}}")
 
@@ -376,6 +440,19 @@ def create_profiling_wrapper(
 
                     peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
                     profile_data["peak_memory_mb"] = peak_mb
+
+                    # Total VRAM and memory utilization ratio
+                    # Evidence source: torch.cuda.get_device_properties().total_memory
+                    try:
+                        device_props = torch.cuda.get_device_properties(
+                            torch.cuda.current_device()
+                        )
+                        total_vram_mb = device_props.total_memory / (1024 * 1024)
+                        profile_data["total_vram_mb"] = total_vram_mb
+                        if total_vram_mb > 0:
+                            profile_data["memory_utilization_ratio"] = peak_mb / total_vram_mb
+                    except Exception:
+                        pass
 
                     # Memory timeline from snapshot
                     if snapshot and "segments" in snapshot:
@@ -418,6 +495,38 @@ def create_profiling_wrapper(
                 profile_data["dataloader_throughput"] = throughput
                 profile_data["dataloader_stall_time_ms"] = avg_stall
                 profile_data["dataloader_bottleneck"] = is_bottleneck
+
+            # ---- H2D transfer time ----
+            # Evidence source: monkey-patched Tensor.to() / Tensor.cuda()
+            h2d_times = _h2d_stats["transfer_times_ms"]
+            if h2d_times and step_times:
+                total_h2d = sum(h2d_times)
+                num_steps = len(step_times)
+                profile_data["h2d_transfer_time_ms"] = total_h2d / num_steps if num_steps > 0 else 0.0
+
+            # ---- Compile warmup detection ----
+            # Evidence source: step time variance between early and steady-state steps
+            # If first few steps are dramatically slower, torch.compile warmup is likely
+            if step_times and len(step_times) >= 4:
+                # Split into first quarter (warmup) and last half (steady state)
+                quarter = max(1, len(step_times) // 4)
+                half = max(1, len(step_times) // 2)
+                warmup_avg = sum(step_times[:quarter]) / quarter
+                steady_avg = sum(step_times[half:]) / len(step_times[half:])
+                # If warmup steps are 3x+ slower, attribute the difference to compile
+                if warmup_avg > steady_avg * 3 and steady_avg > 0:
+                    compile_overhead_s = sum(
+                        max(0, t - steady_avg) for t in step_times[:quarter]
+                    )
+                    profile_data["compile_warmup_time_s"] = compile_overhead_s
+
+            # ---- CPU data pipeline time ----
+            # Evidence source: DataLoader stall_times (cpu time spent fetching batches)
+            stall_times = _dl_stats["stall_times"]
+            if stall_times and step_times:
+                num_steps = len(step_times)
+                total_cpu_data = sum(stall_times)  # already in ms
+                profile_data["cpu_data_pipeline_ms"] = total_cpu_data / num_steps if num_steps > 0 else 0.0
 
             # ---- Save dataloader stats ----
             with open(ARTIFACT_DIR / "dataloader_stats.json", "w") as f:

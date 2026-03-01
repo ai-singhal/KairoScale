@@ -6,6 +6,7 @@ Used for local/demo runs when API-backed LLM providers are unavailable.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from gpunity.optimizer.policy import apply_hardware_priors
 from gpunity.types import (
@@ -16,6 +17,9 @@ from gpunity.types import (
     RiskLevel,
 )
 
+if TYPE_CHECKING:
+    from gpunity.diagnosis.bottleneck import BottleneckDiagnosis
+
 
 _ATTN_KEYWORDS = (
     "attention",
@@ -23,6 +27,22 @@ _ATTN_KEYWORDS = (
     "scaled_dot_product_attention",
     "sdpa",
     "qkv",
+)
+
+_CONV_KEYWORDS = (
+    "conv2d",
+    "conv3d",
+    "convolution",
+    "cudnn_convolution",
+    "aten::conv2d",
+    "aten::conv3d",
+    "aten::convolution",
+    "aten::cudnn_convolution",
+)
+
+_CONV3D_KEYWORDS = (
+    "conv3d",
+    "aten::conv3d",
 )
 
 _OPTIMIZER_KEYWORDS = (
@@ -66,22 +86,311 @@ def _has_optimizer_signal(profile: ProfileResult) -> tuple[bool, list[str]]:
     return False, []
 
 
+def _has_conv_signal(profile: ProfileResult) -> tuple[bool, bool, float, list[str]]:
+    """Detect convolution-heavy workloads.
+
+    Returns:
+        (has_conv, is_3d, conv_pct, evidence)
+    """
+    conv_pct = 0.0
+    is_3d = False
+    evidence = []
+    for op in profile.top_operators:
+        name = op.name.lower()
+        if any(k in name for k in _CONV_KEYWORDS):
+            conv_pct += op.pct_total
+            evidence.append(
+                f"Operator `{op.name}` accounts for {op.pct_total:.1f}% of GPU time"
+            )
+            if any(k in name for k in _CONV3D_KEYWORDS):
+                is_3d = True
+    if conv_pct > 0:
+        evidence.insert(0, f"Conv ops total {conv_pct:.1f}% of GPU time")
+        return True, is_3d, conv_pct, evidence
+    return False, False, 0.0, []
+
+
+def _add_bottleneck_configs(
+    diagnosis: BottleneckDiagnosis,
+    profile: ProfileResult,
+    configs: list[OptimizationConfig],
+    add,
+    max_configs: int,
+) -> None:
+    """Add optimization configs targeted at the diagnosed bottleneck.
+
+    Each config cites the bottleneck diagnosis evidence so the
+    recommendation chain is traceable.
+    """
+    from gpunity.diagnosis.bottleneck import BottleneckType
+
+    bt = diagnosis.primary
+    evidence = list(diagnosis.evidence)
+
+    if bt == BottleneckType.DATA_STARVED:
+        add(OptimizationConfig(
+            id=f"opt-{len(configs) + 1:03d}",
+            name="Fix data starvation: increase DataLoader workers + pin memory",
+            description=(
+                "Bottleneck diagnosis: GPU is idle waiting for data. "
+                "Increasing num_workers and enabling pin_memory reduces "
+                "host-side data loading stalls."
+            ),
+            optimization_type=OptimizationType.DATA_LOADING,
+            evidence=evidence,
+            config_overrides={
+                "dataloader_num_workers": 8,
+                "dataloader_pin_memory": True,
+            },
+            estimated_speedup=1.30,
+            estimated_memory_delta=0.0,
+            risk_level=RiskLevel.LOW,
+            heuristic_rationale=[
+                f"Diagnosed as {bt.value}",
+                "More workers + pinned memory reduces DataLoader stall time",
+            ],
+        ))
+        add(OptimizationConfig(
+            id=f"opt-{len(configs) + 1:03d}",
+            name="Fix data starvation: prefetch + async data pipeline",
+            description=(
+                "Bottleneck diagnosis: data pipeline is the bottleneck. "
+                "Enable prefetch_factor and persistent workers to keep the "
+                "data pipeline ahead of GPU consumption."
+            ),
+            optimization_type=OptimizationType.DATA_LOADING,
+            evidence=evidence,
+            config_overrides={
+                "dataloader_num_workers": 8,
+                "dataloader_pin_memory": True,
+                "dataloader_prefetch_factor": 4,
+                "dataloader_persistent_workers": True,
+            },
+            estimated_speedup=1.40,
+            estimated_memory_delta=0.05,
+            risk_level=RiskLevel.LOW,
+            heuristic_rationale=[
+                f"Diagnosed as {bt.value}",
+                "Prefetch keeps GPU fed while CPU prepares next batches",
+            ],
+        ))
+
+    elif bt == BottleneckType.VRAM_STARVED:
+        add(OptimizationConfig(
+            id=f"opt-{len(configs) + 1:03d}",
+            name="Fix VRAM starvation: enable mixed precision (bf16)",
+            description=(
+                "Bottleneck diagnosis: GPU memory near capacity. "
+                "Mixed precision halves activation memory and enables "
+                "tensor core throughput gains."
+            ),
+            optimization_type=OptimizationType.MIXED_PRECISION,
+            evidence=evidence,
+            config_overrides={"amp": True, "precision": "bf16"},
+            estimated_speedup=1.20,
+            estimated_memory_delta=-0.40,
+            risk_level=RiskLevel.LOW,
+            heuristic_rationale=[
+                f"Diagnosed as {bt.value}",
+                "bf16 reduces activation memory by ~50%",
+            ],
+        ))
+        add(OptimizationConfig(
+            id=f"opt-{len(configs) + 1:03d}",
+            name="Fix VRAM starvation: gradient checkpointing + AMP",
+            description=(
+                "Bottleneck diagnosis: peak memory near VRAM limit. "
+                "Gradient checkpointing trades compute for memory, "
+                "combined with AMP for maximum memory savings."
+            ),
+            optimization_type=OptimizationType.MEMORY,
+            evidence=evidence,
+            config_overrides={
+                "gradient_checkpointing": True,
+                "amp": True,
+                "precision": "bf16",
+            },
+            estimated_speedup=1.05,
+            estimated_memory_delta=-0.50,
+            risk_level=RiskLevel.MEDIUM,
+            heuristic_rationale=[
+                f"Diagnosed as {bt.value}",
+                "Checkpointing + AMP can free 50%+ of activation memory",
+            ],
+        ))
+
+    elif bt == BottleneckType.TRANSFER_BOUND:
+        add(OptimizationConfig(
+            id=f"opt-{len(configs) + 1:03d}",
+            name="Fix PCIe bottleneck: pin memory + non-blocking transfers",
+            description=(
+                "Bottleneck diagnosis: H2D transfer time dominates step time. "
+                "Pinned memory and non_blocking=True on .to(device) calls "
+                "enable overlapped CPU→GPU transfers."
+            ),
+            optimization_type=OptimizationType.DATA_LOADING,
+            evidence=evidence,
+            config_overrides={
+                "dataloader_pin_memory": True,
+                "dataloader_num_workers": 4,
+            },
+            estimated_speedup=1.25,
+            estimated_memory_delta=0.0,
+            risk_level=RiskLevel.LOW,
+            heuristic_rationale=[
+                f"Diagnosed as {bt.value}",
+                "Pinned memory enables async DMA transfers over PCIe",
+            ],
+        ))
+
+    elif bt == BottleneckType.COMPILE_BOUND:
+        add(OptimizationConfig(
+            id=f"opt-{len(configs) + 1:03d}",
+            name="Fix compile overhead: use reduce-overhead mode",
+            description=(
+                "Bottleneck diagnosis: torch.compile warmup dominates runtime. "
+                "Switching from max-autotune to reduce-overhead mode cuts "
+                "compilation time while retaining most kernel fusion benefits."
+            ),
+            optimization_type=OptimizationType.COMPILATION,
+            evidence=evidence,
+            config_overrides={
+                "compile": True,
+                "compile_mode": "reduce-overhead",
+            },
+            estimated_speedup=1.15,
+            estimated_memory_delta=-0.05,
+            risk_level=RiskLevel.LOW,
+            heuristic_rationale=[
+                f"Diagnosed as {bt.value}",
+                "reduce-overhead compiles faster than max-autotune",
+            ],
+        ))
+        add(OptimizationConfig(
+            id=f"opt-{len(configs) + 1:03d}",
+            name="Skip compile: eager mode with AMP",
+            description=(
+                "Bottleneck diagnosis: compile overhead too high for this "
+                "workload size. Run in eager mode with AMP for immediate "
+                "speedup without compilation cost."
+            ),
+            optimization_type=OptimizationType.MIXED_PRECISION,
+            evidence=evidence,
+            config_overrides={
+                "compile": False,
+                "amp": True,
+                "precision": "bf16",
+            },
+            estimated_speedup=1.10,
+            estimated_memory_delta=-0.30,
+            risk_level=RiskLevel.LOW,
+            heuristic_rationale=[
+                f"Diagnosed as {bt.value}",
+                "Eager + AMP avoids compile overhead entirely",
+            ],
+        ))
+
+    elif bt == BottleneckType.COMPUTE_BOUND:
+        # GPU is well-utilized. Not much to optimize on this hardware.
+        # The main win is trying cheaper hardware (handled by GPU selector).
+        if diagnosis.gpu_downgrade_candidates:
+            add(OptimizationConfig(
+                id=f"opt-{len(configs) + 1:03d}",
+                name="Compute-bound: try cheaper GPU for cost savings",
+                description=(
+                    "Bottleneck diagnosis: GPU is fully utilized with no "
+                    "starvation. The workload may run at similar speed on "
+                    f"cheaper hardware. Candidates: "
+                    f"{', '.join(diagnosis.gpu_downgrade_candidates)}."
+                ),
+                optimization_type=OptimizationType.COMPILATION,
+                evidence=evidence + [
+                    f"GPU downgrade candidates: {diagnosis.gpu_downgrade_candidates}"
+                ],
+                config_overrides={},
+                estimated_speedup=1.0,
+                estimated_memory_delta=0.0,
+                risk_level=RiskLevel.LOW,
+                heuristic_rationale=[
+                    f"Diagnosed as {bt.value}",
+                    "GPU cost reduction is the primary optimization lever",
+                ],
+            ))
+
+
 def generate_heuristic_configs(
     profile: ProfileResult,
     repo_path: Path,
     max_configs: int = 10,
     hardware_profile: HardwareProfile | None = None,
     mode: str = "train",
+    diagnosis: BottleneckDiagnosis | None = None,
 ) -> list[OptimizationConfig]:
-    """Generate optimization configs directly from profile signals."""
+    """Generate optimization configs directly from profile signals.
+
+    When a BottleneckDiagnosis is provided, configs are prioritized
+    based on the diagnosed bottleneck type rather than just operator
+    pattern matching.
+    """
     configs: list[OptimizationConfig] = []
 
     def add(config: OptimizationConfig) -> None:
         if len(configs) < max_configs:
             configs.append(config)
 
+    # Bottleneck-driven configs (highest priority — added first)
+    if diagnosis is not None:
+        _add_bottleneck_configs(diagnosis, profile, configs, add, max_configs)
+
     has_attention, attn_evidence = _has_attention_signal(profile)
     has_optimizer, optimizer_evidence = _has_optimizer_signal(profile)
+    has_conv, is_3d_conv, conv_pct, conv_evidence = _has_conv_signal(profile)
+
+    if has_conv:
+        mem_format = "channels_last_3d" if is_3d_conv else "channels_last"
+        dim_label = "3D" if is_3d_conv else "2D"
+        add(OptimizationConfig(
+            id=f"opt-{len(configs) + 1:03d}",
+            name=f"Convert model to {mem_format} memory format",
+            description=(
+                f"Profile shows {dim_label} convolution ops dominating GPU time "
+                f"({conv_pct:.1f}%). Converting model and input tensors to "
+                f"{mem_format} memory format enables hardware-optimized NHWC/NDHWC "
+                f"kernels for 10-30% speedup on conv-heavy workloads."
+            ),
+            optimization_type=OptimizationType.MEMORY_FORMAT,
+            evidence=conv_evidence,
+            config_overrides={"memory_format": mem_format},
+            estimated_speedup=1.20,
+            estimated_memory_delta=0.0,
+            risk_level=RiskLevel.LOW,
+            heuristic_rationale=[
+                f"Conv ops occupy {conv_pct:.1f}% of GPU time",
+                f"{mem_format} enables hardware-native NHWC layout for conv kernels",
+            ],
+        ))
+
+        add(OptimizationConfig(
+            id=f"opt-{len(configs) + 1:03d}",
+            name="Enable cuDNN auto-tuner (benchmark mode)",
+            description=(
+                f"Conv ops dominate GPU time ({conv_pct:.1f}%). Enabling "
+                "cudnn.benchmark lets cuDNN auto-select the fastest convolution "
+                "algorithm for the given input shapes, typically yielding 5-15% "
+                "speedup for fixed-size conv workloads."
+            ),
+            optimization_type=OptimizationType.COMPILATION,
+            evidence=conv_evidence,
+            config_overrides={"cudnn_benchmark": True},
+            estimated_speedup=1.10,
+            estimated_memory_delta=0.0,
+            risk_level=RiskLevel.LOW,
+            heuristic_rationale=[
+                "cuDNN benchmark auto-selects fastest conv algorithm",
+                "Most effective for fixed-shape inputs (no dynamic shapes)",
+            ],
+        ))
+
     if has_attention:
         add(OptimizationConfig(
             id=f"opt-{len(configs) + 1:03d}",
@@ -218,6 +527,76 @@ def generate_heuristic_configs(
             estimated_speedup=0.95,
             estimated_memory_delta=-0.35,
             risk_level=RiskLevel.MEDIUM,
+        ))
+
+    # Stacked/combo config: combine top compatible low-risk optimizations
+    if has_conv and len(configs) < max_configs:
+        mem_format = "channels_last_3d" if is_3d_conv else "channels_last"
+        dim_label = "3D" if is_3d_conv else "2D"
+        combo_overrides = {
+            "compile": True,
+            "compile_mode": "max-autotune",
+            "amp": True,
+            "precision": "bf16",
+            "memory_format": mem_format,
+            "cudnn_benchmark": True,
+        }
+        combo_evidence = list(conv_evidence)
+        combo_evidence.append(
+            "Stacking compile + AMP + memory format + cuDNN benchmark "
+            "for compound speedup"
+        )
+        add(OptimizationConfig(
+            id=f"opt-{len(configs) + 1:03d}",
+            name=f"Stacked {dim_label} CNN optimization combo",
+            description=(
+                f"Combines torch.compile (max-autotune), bf16 mixed precision, "
+                f"{mem_format} memory format, and cuDNN benchmark mode. "
+                f"Individual optimizations yield 5-20% each; stacked together "
+                f"they can compound to 30-50%+ on conv-heavy workloads."
+            ),
+            optimization_type=OptimizationType.COMPILATION,
+            evidence=combo_evidence,
+            config_overrides=combo_overrides,
+            estimated_speedup=1.40,
+            estimated_memory_delta=-0.20,
+            risk_level=RiskLevel.MEDIUM,
+            heuristic_rationale=[
+                "Compound gains from stacking compatible optimizations",
+                f"Conv ops at {conv_pct:.1f}% are primary target",
+                "max-autotune explores more fusion opportunities",
+            ],
+        ))
+    elif not has_conv and len(configs) < max_configs:
+        # Generic stacked config for non-conv workloads
+        combo_overrides = {
+            "compile": True,
+            "compile_mode": "max-autotune",
+            "amp": True,
+            "precision": "bf16",
+        }
+        combo_evidence = [
+            "Stacking compile + AMP for compound speedup on general workloads"
+        ]
+        if has_attention:
+            combo_evidence.extend(attn_evidence)
+        add(OptimizationConfig(
+            id=f"opt-{len(configs) + 1:03d}",
+            name="Stacked compile + AMP optimization combo",
+            description=(
+                "Combines torch.compile (max-autotune) with bf16 mixed precision. "
+                "These are broadly compatible and typically yield 15-30% combined "
+                "speedup."
+            ),
+            optimization_type=OptimizationType.COMPILATION,
+            evidence=combo_evidence,
+            config_overrides=combo_overrides,
+            estimated_speedup=1.25,
+            estimated_memory_delta=-0.15,
+            risk_level=RiskLevel.MEDIUM,
+            heuristic_rationale=[
+                "Compound gains from stacking compile + AMP",
+            ],
         ))
 
     if not configs:

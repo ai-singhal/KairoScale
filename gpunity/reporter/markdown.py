@@ -71,6 +71,10 @@ def generate_report(
     if hardware_profile is not None:
         sections.append(_render_hardware_context(hardware_profile))
 
+    # Bottleneck Diagnosis
+    if run_summary is not None and run_summary.bottleneck_type:
+        sections.append(_render_bottleneck_diagnosis(run_summary))
+
     # Profile Analysis
     sections.append(_render_profile_analysis(profile))
 
@@ -197,6 +201,52 @@ def _render_hardware_context(hardware: HardwareProfile) -> str:
     )
     for note in hardware.notes:
         lines.append(f"- Note: {note}")
+    return "\n".join(lines)
+
+
+def _render_bottleneck_diagnosis(run_summary: RunSummary) -> str:
+    """Render the bottleneck diagnosis section with evidence chain."""
+    lines = ["## Bottleneck Diagnosis\n"]
+
+    bottleneck_labels = {
+        "data_starved": "Data Starved (RAM/DataLoader)",
+        "vram_starved": "VRAM Starved (GPU Memory)",
+        "compute_bound": "Compute Bound (GPU Saturated)",
+        "transfer_bound": "Transfer Bound (PCIe/H2D)",
+        "compile_bound": "Compile Bound (torch.compile overhead)",
+    }
+    label = bottleneck_labels.get(
+        run_summary.bottleneck_type, run_summary.bottleneck_type
+    )
+    lines.append(f"**Primary bottleneck**: {label}\n")
+
+    if run_summary.bottleneck_evidence:
+        lines.append("**Evidence**:")
+        for ev in run_summary.bottleneck_evidence:
+            lines.append(f"- {ev}")
+        lines.append("")
+
+    # GPU selection results
+    if run_summary.gpu_selection_results:
+        lines.append("### GPU Cost Optimization\n")
+        lines.append("| GPU | Speedup vs Control | Viable | Cost Savings |")
+        lines.append("|-----|-------------------|--------|-------------|")
+        for gr in run_summary.gpu_selection_results:
+            viable = "YES" if gr.get("viable") else "No"
+            speedup = f"{gr.get('speedup_vs_control', 0):.2f}x"
+            savings = f"{gr.get('cost_savings_pct', 0):.0f}%"
+            error = gr.get("error")
+            if error:
+                lines.append(f"| {gr['gpu_type']} | FAILED | No | - |")
+            else:
+                lines.append(f"| {gr['gpu_type']} | {speedup} | {viable} | {savings} |")
+
+        if run_summary.recommended_gpu:
+            lines.append(
+                f"\n**Recommended GPU**: `{run_summary.recommended_gpu}` — "
+                f"maintains performance at lower cost"
+            )
+
     return "\n".join(lines)
 
 

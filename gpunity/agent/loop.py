@@ -58,6 +58,7 @@ async def run_agent_loop(
     config: RunConfig,
     hardware_profile: HardwareProfile | None = None,
     mode: str = "train",
+    diagnosis=None,
 ) -> list[OptimizationConfig]:
     """Run deterministic + LLM-backed config generation."""
     deterministic_candidates = generate_heuristic_configs(
@@ -66,6 +67,7 @@ async def run_agent_loop(
         max_configs=max(config.max_configs, config.top_k),
         hardware_profile=hardware_profile,
         mode=mode,
+        diagnosis=diagnosis,
     )
 
     if config.provider == "heuristic":
@@ -78,10 +80,12 @@ async def run_agent_loop(
 
     provider = _get_provider(config)
     tools = get_agent_tools(profile, repo_path)
+    bottleneck_summary = diagnosis.summary() if diagnosis else ""
     system_prompt = get_system_prompt(
         profile.summary(),
         mode=mode,
         objective_profile=config.objective_profile,
+        bottleneck_summary=bottleneck_summary,
     )
     context = {"profile": profile, "repo_path": repo_path}
 

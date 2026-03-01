@@ -515,6 +515,7 @@ def create_gradient_tracking_wrapper(
 
             repo_dir = REPO_DIR
             sys.path.insert(0, repo_dir)
+            os.chdir(repo_dir)
             os.environ["TRAIN_STEPS"] = str(TOTAL_STEPS)
 
             def _invoke_fallback_entry(module_obj):

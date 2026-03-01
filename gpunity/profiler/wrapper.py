@@ -256,9 +256,10 @@ def create_profiling_wrapper(
         def run_profiling():
             import importlib.util
 
-            # Add repo to path
+            # Add repo to path and set CWD so relative imports/opens work
             repo_dir = os.environ.get("REPO_DIR", os.getcwd())
             sys.path.insert(0, repo_dir)
+            os.chdir(repo_dir)
 
             def _invoke_fallback_entry(module_obj):
                 for candidate in ("train", "main", "run"):

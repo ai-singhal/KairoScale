@@ -7,6 +7,7 @@ import io
 import json
 import os
 import sys
+import threading
 import zipfile
 from datetime import datetime
 from dataclasses import dataclass
@@ -50,15 +51,26 @@ def _run_coro(coro: Any) -> Any:
     """
     try:
         asyncio.get_running_loop()
-        # Already inside a loop — create a new one on a thread-safe basis.
-        loop = asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(coro)
-        finally:
-            loop.close()
     except RuntimeError:
-        # No running loop — safe to use asyncio.run().
+        # No running loop in this thread — safe to run directly.
         return asyncio.run(coro)
+
+    result_box: dict[str, Any] = {}
+    error_box: dict[str, BaseException] = {}
+
+    def _runner() -> None:
+        try:
+            result_box["value"] = asyncio.run(coro)
+        except BaseException as exc:
+            error_box["error"] = exc
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join()
+
+    if "error" in error_box:
+        raise error_box["error"]
+    return result_box.get("value")
 
 
 def _export_configs(configs: list[OptimizationConfig], output_dir: Path) -> Path:
@@ -153,7 +165,10 @@ async def _execute_pipeline_phased(
             log_callback(message)
 
     log_step(f"Phase 1: Profiling training script in {sandbox_mode}...")
-    profile_result = await run_profile_phase(config)
+    modal_log_callback = None
+    if log_callback is not None:
+        modal_log_callback = lambda message: log_callback(f"[Modal] {message}")
+    profile_result = await run_profile_phase(config, log_callback=modal_log_callback)
     gpu_util = getattr(profile_result, "gpu_utilization", None)
     peak_mem = getattr(profile_result, "peak_memory_mb", None)
     phase1_msg = "Phase 1 complete."
@@ -1071,9 +1086,21 @@ def main() -> None:
     if "show_logs" not in st.session_state:
         st.session_state.show_logs = True
 
-    if sidebar["run_clicked"]:
+    if sidebar["run_clicked"] and st.session_state.get("_run_in_progress", False):
+        st.warning("A run is already in progress. Please wait for it to complete.")
+
+    elif sidebar["run_clicked"]:
+        st.session_state._run_in_progress = True
         st.session_state.run_logs = []
-        _append_run_log("Run requested.")
+        live_logs_placeholder = st.empty()
+
+        def _append_and_render_log(message: str) -> None:
+            _append_run_log(message)
+            if st.session_state.get("show_logs", True):
+                logs = st.session_state.get("run_logs", [])
+                live_logs_placeholder.code("\n".join(logs), language="text")
+
+        _append_and_render_log("Run requested.")
         # Set Modal vLLM URL in env if provided
         if sidebar.get("modal_vllm_url"):
             os.environ["MODAL_VLLM_URL"] = sidebar["modal_vllm_url"]
@@ -1106,16 +1133,16 @@ def main() -> None:
             st.session_state._last_run_config = config.to_dict()
             status_placeholder = st.empty()
             status_placeholder.info("Running KairoScale pipeline...")
-            _append_run_log("Running KairoScale pipeline...")
+            _append_and_render_log("Running KairoScale pipeline...")
             result = _run_coro(
                 _execute_pipeline_phased(
                     config,
                     status_placeholder,
-                    log_callback=_append_run_log,
+                    log_callback=_append_and_render_log,
                 )
             )
             status_placeholder.success("Pipeline complete!")
-            _append_run_log("Pipeline complete.")
+            _append_and_render_log("Pipeline complete.")
             st.session_state.last_result = result
             st.session_state._last_repo_path = sidebar["repo_path"]
             st.session_state._last_entry_point = sidebar["entry_point"]
@@ -1127,7 +1154,9 @@ def main() -> None:
         except Exception as exc:
             st.session_state.last_error = str(exc)
             st.session_state.last_result = None
-            _append_run_log(f"Pipeline failed: {exc}")
+            _append_and_render_log(f"Pipeline failed: {exc}")
+        finally:
+            st.session_state._run_in_progress = False
 
     if st.session_state.last_error:
         st.error(st.session_state.last_error)

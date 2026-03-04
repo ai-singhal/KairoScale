@@ -9,7 +9,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import click
 
@@ -522,7 +522,10 @@ async def run_pipeline(config: RunConfig) -> Path:
     return report_path
 
 
-async def run_profile_phase(config: RunConfig):
+async def run_profile_phase(
+    config: RunConfig,
+    log_callback: Optional[Callable[[str], None]] = None,
+):
     """Execute Phase 1: Profiling."""
     from KairoScale.profiler.wrapper import create_profiling_wrapper
     from KairoScale.profiler.aggregate import aggregate_profile
@@ -562,6 +565,7 @@ async def run_profile_phase(config: RunConfig):
             gpu_type=config.gpu_type,
             timeout_seconds=profile_timeout_seconds,
             cost_ceiling_usd=config.max_cost_per_sandbox,
+            log_callback=log_callback,
         )
 
     # Aggregate results

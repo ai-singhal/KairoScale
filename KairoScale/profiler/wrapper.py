@@ -119,6 +119,7 @@ def create_profiling_wrapper(
 
         WARMUP_STEPS = {warmup_steps}
         PROFILE_STEPS = {profile_steps}
+        PROFILE_CAPTURE_STEPS = min(PROFILE_STEPS, 20)
         TOTAL_STEPS = {total_steps}
         ENTRY_POINT = "{entry_point}"
         TRAIN_FUNCTION = {repr(train_function)}
@@ -341,27 +342,25 @@ def create_profiling_wrapper(
             if has_cuda:
                 try:
                     from torch.profiler import profile, ProfilerActivity, schedule
+                    print(
+                        f"[KairoScale] Initializing torch.profiler "
+                        f"(warmup={{WARMUP_STEPS}}, active={{PROFILE_CAPTURE_STEPS}})"
+                    )
                     profiler_ctx = profile(
                         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                         schedule=schedule(
-                            wait=0, warmup=WARMUP_STEPS, active=PROFILE_STEPS, repeat=1
+                            wait=0, warmup=WARMUP_STEPS, active=PROFILE_CAPTURE_STEPS, repeat=1
                         ),
-                        record_shapes=True,
-                        with_stack=True,
-                        with_flops=True,
-                        on_trace_ready=lambda p: p.export_chrome_trace(
-                            str(ARTIFACT_DIR / "chrome_trace.json")
-                        ),
+                        # Keep Phase 1 lightweight to avoid multi-minute post-processing stalls.
+                        record_shapes=False,
+                        with_stack=False,
+                        with_flops=False,
+                        # NOTE: Deliberately omit on_trace_ready / chrome trace export.
+                        # Exporting traces can stall for minutes even on small models and
+                        # no downstream phase consumes the trace file.
                     )
                 except Exception as e:
                     print(f"[KairoScale] torch.profiler setup failed: {{e}}")
-
-            # ---- Start memory recording if CUDA ----
-            if has_cuda:
-                try:
-                    torch.cuda.memory._record_memory_history(max_entries=100000)
-                except Exception:
-                    pass
 
             # ---- Run the user's training script ----
             try:
@@ -370,6 +369,7 @@ def create_profiling_wrapper(
                     _profiler_ctx_ref[0] = profiler_ctx
 
                 # Import and run the entry point
+                print("[KairoScale] Running training entry point...")
                 spec = importlib.util.spec_from_file_location("__train_module__", entry_path)
                 if spec is None or spec.loader is None:
                     raise ImportError(f"Cannot load {{entry_path}}")
@@ -403,6 +403,7 @@ def create_profiling_wrapper(
             # ---- Extract torch.profiler data ----
             if profiler_ctx is not None:
                 try:
+                    print("[KairoScale] Extracting profiler aggregates...")
                     averages = profiler_ctx.key_averages()
 
                     def _event_cuda_time_us(ev):
@@ -512,12 +513,6 @@ def create_profiling_wrapper(
 
             # ---- Extract memory data ----
             if has_cuda:
-                # Stop recording first (safe even if it wasn't started)
-                try:
-                    torch.cuda.memory._record_memory_history(enabled=None)
-                except Exception:
-                    pass
-
                 # Peak memory -- simple and reliable
                 try:
                     peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)

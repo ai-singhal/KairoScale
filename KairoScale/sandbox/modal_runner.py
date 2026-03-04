@@ -7,10 +7,11 @@ scripts, and downloads artifacts back to the local filesystem.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from KairoScale.sandbox.image_builder import build_image_spec
 from KairoScale.utils.logging import get_logger
@@ -27,6 +28,89 @@ _MODAL_GPU_MAP = {
 }
 
 
+async def _call_maybe_aio(method: Any, *args: Any, **kwargs: Any) -> Any:
+    """Call a Modal SDK method that may expose `.aio` or direct sync behavior."""
+    aio_method = getattr(method, "aio", None)
+    if callable(aio_method):
+        result = aio_method(*args, **kwargs)
+    else:
+        result = method(*args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def _sandbox_ls_entries(sb: Any, path: str) -> list[tuple[str, str]]:
+    """List sandbox entries as `(relative_name, remote_path)` pairs."""
+    listed = await _call_maybe_aio(sb.ls, path)
+    raw_entries: list[Any]
+    if hasattr(listed, "__aiter__"):
+        raw_entries = []
+        async for item in listed:
+            raw_entries.append(item)
+    elif listed is None:
+        raw_entries = []
+    else:
+        raw_entries = list(listed)
+
+    base = path.rstrip("/") or "/"
+    prefix = f"{base}/" if base != "/" else "/"
+    normalized: list[tuple[str, str]] = []
+    for entry in raw_entries:
+        remote_path = ""
+        entry_path = getattr(entry, "path", None)
+        if entry_path:
+            remote_path = str(entry_path)
+        elif isinstance(entry, str):
+            remote_path = entry
+        else:
+            remote_path = str(entry)
+
+        if not remote_path:
+            continue
+        if not remote_path.startswith("/"):
+            remote_path = prefix + remote_path.lstrip("/")
+
+        entry_name = getattr(entry, "name", None)
+        if entry_name:
+            relative = str(entry_name).lstrip("/")
+        elif remote_path.startswith(prefix):
+            relative = remote_path[len(prefix):].lstrip("/")
+        else:
+            relative = Path(remote_path).name
+
+        if relative:
+            normalized.append((relative, remote_path))
+    return normalized
+
+
+async def _read_sandbox_file(sb: Any, remote_path: str, mode: str) -> Any:
+    """Read a file from sandbox using Modal FileIO APIs across SDK variants."""
+    handle = await _call_maybe_aio(sb.open, remote_path, mode)
+    try:
+        return await _call_maybe_aio(handle.read)
+    finally:
+        try:
+            await _call_maybe_aio(handle.close)
+        except Exception:
+            pass
+
+
+async def _read_stream_text(stream: Any) -> str:
+    """Read Modal stdout/stderr stream and normalize to text."""
+    if stream is None or not hasattr(stream, "read"):
+        return ""
+    try:
+        payload = await _call_maybe_aio(stream.read)
+    except Exception:
+        return ""
+    if isinstance(payload, bytes):
+        return payload.decode("utf-8", errors="replace")
+    if payload is None:
+        return ""
+    return str(payload)
+
+
 async def run_in_modal(
     repo_path: Path,
     script_content: str,
@@ -36,6 +120,7 @@ async def run_in_modal(
     extra_deps: Optional[list[str]] = None,
     stream_logs: bool = False,
     persist_volume_name: Optional[str] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
 ) -> Path:
     """Run a script in a Modal sandbox with GPU.
 
@@ -51,6 +136,7 @@ async def run_in_modal(
         extra_deps: Additional pip packages to install.
         stream_logs: If True, print sandbox stdout to the terminal.
         persist_volume_name: Optional Modal Volume name to persist artifacts.
+        log_callback: Optional callback to surface sandbox lifecycle logs.
 
     Returns:
         Local path to downloaded artifacts directory.
@@ -66,6 +152,14 @@ async def run_in_modal(
             "Modal is not installed. Install with: pip install modal\n"
             "Or use --local flag for local execution."
         )
+
+    def _emit(message: str) -> None:
+        logger.info(message)
+        if log_callback is not None:
+            try:
+                log_callback(message)
+            except Exception:
+                logger.debug("Modal log callback failed.", exc_info=True)
 
     repo_path = Path(repo_path).resolve()
     image_spec = build_image_spec(repo_path, extra_deps)
@@ -93,6 +187,7 @@ async def run_in_modal(
 
     # Create artifact directory locally
     local_artifact_dir = Path(tempfile.mkdtemp(prefix="KairoScale_modal_artifacts_"))
+    resolved_artifact_root = local_artifact_dir.resolve()
 
     # Write script to a temp file and add to image
     script_path = local_artifact_dir / "KairoScale_wrapper.py"
@@ -108,13 +203,13 @@ async def run_in_modal(
         vol = modal.Volume.from_name(persist_volume_name, create_if_missing=True)
         volume_mounts = {"/output": vol}
 
-    logger.info(f"Creating Modal sandbox with {modal_gpu} GPU")
-    logger.info(f"Timeout: {timeout_seconds}s, Cost ceiling: ${cost_ceiling_usd}")
+    _emit(f"Creating Modal sandbox with {modal_gpu} GPU")
+    _emit(f"Timeout: {timeout_seconds}s, Cost ceiling: ${cost_ceiling_usd}")
 
     sandbox_artifact_dir = "/tmp/KairoScale_artifacts"
 
     connect_timeout_seconds = min(120, max(20, timeout_seconds // 3))
-    logger.info(
+    _emit(
         f"Resolving Modal app handle (timeout={connect_timeout_seconds}s)..."
     )
     try:
@@ -131,20 +226,20 @@ async def run_in_modal(
         raise RuntimeError(f"Failed to initialize Modal app handle: {exc}") from exc
 
     try:
-        wrapper_done_flag = "/tmp/KairoScale_wrapper_done"
         wrapper_exit_code_file = "/tmp/KairoScale_wrapper_exit_code"
         runner_cmd = (
-            "python3 /root/script/KairoScale_wrapper.py; "
+            "echo '[KairoScale] Wrapper starting'; "
+            "python3 -u /root/script/KairoScale_wrapper.py; "
             "code=$?; "
             f"echo $code > {wrapper_exit_code_file}; "
-            f"touch {wrapper_done_flag}; "
-            "sleep 600"
+            "echo \"[KairoScale] Wrapper exit code: $code\"; "
+            "sleep 15"
         )
 
         # Cold starts (new image pull/build + GPU provisioning) can exceed 3 minutes.
         # Keep a buffer for execution while allowing enough time for sandbox creation.
         create_timeout_seconds = max(180, timeout_seconds - 60)
-        logger.info(
+        _emit(
             f"Submitting Modal sandbox create request (timeout={create_timeout_seconds}s)..."
         )
         try:
@@ -159,7 +254,8 @@ async def run_in_modal(
                     env={
                         "ARTIFACT_DIR": sandbox_artifact_dir,
                         "REPO_DIR": "/root/repo",
-                        "PYTHONPATH": "/root/repo",
+                        "PYTHONPATH": "/root:/root/repo",
+                        "PYTHONUNBUFFERED": "1",
                     },
                     app=app,
                     **({"volumes": volume_mounts} if volume_mounts else {}),
@@ -173,56 +269,66 @@ async def run_in_modal(
                 "or the image/GPU cold start took too long."
             ) from exc
 
-        # Wait for the wrapper script to complete while keeping sandbox alive.
+        # Wait for wrapper exit-code file to appear while sandbox stays alive.
         start = time.monotonic()
+        last_progress_bucket = -1
+        wrapper_exit_code: Optional[int] = None
         while True:
-            if time.monotonic() - start > timeout_seconds:
+            elapsed = time.monotonic() - start
+            if elapsed > timeout_seconds:
                 raise RuntimeError(
                     f"Modal sandbox timed out after {timeout_seconds}s waiting for wrapper completion."
                 )
+
+            progress_bucket = int(elapsed // 30)
+            if progress_bucket > last_progress_bucket and progress_bucket > 0:
+                _emit(f"Modal sandbox still running ({int(elapsed)}s elapsed)...")
+                last_progress_bucket = progress_bucket
+
             try:
-                tmp_items = await sb.ls.aio("/tmp")
-                if Path(wrapper_done_flag).name in tmp_items:
-                    break
+                wrapper_exit_code_raw = await _read_sandbox_file(sb, wrapper_exit_code_file, "r")
+                wrapper_exit_code = int(str(wrapper_exit_code_raw).strip())
+                _emit(f"Modal wrapper finished with exit code {wrapper_exit_code}.")
+                break
+            except FileNotFoundError:
+                # Wrapper still running.
+                pass
+            except (TypeError, ValueError):
+                # File exists but value isn't fully written yet.
+                pass
             except Exception:
                 # Sandbox may still be booting; retry.
                 pass
             await asyncio.sleep(1.0)
 
-        # Fetch wrapper exit code written by the runner command.
-        exit_code_handle = await sb.open.aio(wrapper_exit_code_file, "r")
-        try:
-            wrapper_exit_code_raw = await exit_code_handle.read.aio()
-        finally:
-            await exit_code_handle.close.aio()
-
-        try:
-            wrapper_exit_code = int(str(wrapper_exit_code_raw).strip())
-        except ValueError as exc:
+        if wrapper_exit_code is None:
             raise RuntimeError(
-                f"Could not parse wrapper exit code from {wrapper_exit_code_file}: {wrapper_exit_code_raw!r}"
-            ) from exc
+                f"Could not read wrapper exit code from {wrapper_exit_code_file}."
+            )
 
         if stream_logs:
             try:
-                stdout_content = await sb.stdout.read.aio()
+                stdout_content = await _read_stream_text(getattr(sb, "stdout", None))
                 if stdout_content:
                     print(stdout_content)
+                    if log_callback is not None:
+                        for line in stdout_content.splitlines():
+                            if line.strip():
+                                log_callback(f"[sandbox] {line}")
             except Exception:
                 pass
 
         # Download artifacts from sandbox (use async file APIs for Modal>=1.x)
-        artifact_items = await sb.ls.aio(sandbox_artifact_dir)
-        for item in artifact_items:
-            remote_path = f"{sandbox_artifact_dir}/{item}"
+        artifact_items = await _sandbox_ls_entries(sb, sandbox_artifact_dir)
+        for item, remote_path in artifact_items:
             try:
-                file_handle = await sb.open.aio(remote_path, "rb")
-                try:
-                    content = await file_handle.read.aio()
-                finally:
-                    await file_handle.close.aio()
+                content = await _read_sandbox_file(sb, remote_path, "rb")
+                if not isinstance(content, (bytes, bytearray)):
+                    content = str(content).encode("utf-8")
 
-                dest = local_artifact_dir / item
+                dest = (resolved_artifact_root / item).resolve()
+                if dest != resolved_artifact_root and resolved_artifact_root not in dest.parents:
+                    continue
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(content)
             except Exception:
@@ -233,28 +339,22 @@ async def run_in_modal(
         if persist_volume_name:
             try:
                 copy_cmd = f"cp -r {sandbox_artifact_dir}/* /output/ 2>/dev/null; cp -r /root/repo /output/repo 2>/dev/null"
-                copy_proc = await sb.exec.aio("bash", "-c", copy_cmd)
-                await copy_proc.wait.aio()
-                logger.info(f"Persisted artifacts to Modal Volume: {persist_volume_name}")
+                copy_proc = await _call_maybe_aio(sb.exec, "bash", "-c", copy_cmd)
+                await _call_maybe_aio(copy_proc.wait)
+                _emit(f"Persisted artifacts to Modal Volume: {persist_volume_name}")
             except Exception as e:
                 logger.warning(f"Failed to persist to volume: {e}")
 
         # Terminate the sleep process, then read full logs.
-        await sb.terminate.aio()
+        await _call_maybe_aio(sb.terminate)
         try:
-            await sb.wait.aio()
+            await _call_maybe_aio(sb.wait)
         except Exception:
             # Expected after explicit terminate() on some Modal SDK versions.
             pass
 
-        try:
-            stdout = await sb.stdout.read.aio()
-        except Exception:
-            stdout = ""
-        try:
-            stderr = await sb.stderr.read.aio()
-        except Exception:
-            stderr = ""
+        stdout = await _read_stream_text(getattr(sb, "stdout", None))
+        stderr = await _read_stream_text(getattr(sb, "stderr", None))
 
         if stdout:
             logger.info(f"Modal stdout:\n{stdout}")
@@ -279,5 +379,5 @@ async def run_in_modal(
         except OSError:
             pass
 
-    logger.info(f"Modal run complete. Artifacts in: {local_artifact_dir}")
+    _emit(f"Modal run complete. Artifacts in: {local_artifact_dir}")
     return local_artifact_dir
